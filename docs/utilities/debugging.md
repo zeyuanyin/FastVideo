@@ -27,7 +27,29 @@ Useful variables:
 - `FASTVIDEO_LOGGING_LEVEL`: `DEBUG`, `INFO`, `WARNING`, `ERROR`
 - `FASTVIDEO_STAGE_LOGGING`: print per-stage timings during pipeline execution
 - `FASTVIDEO_ATTENTION_BACKEND`: force an attention backend (for example
-  `TORCH_SDPA` or `FLASH_ATTN`)
+  `TORCH_SDPA`, `FLASH_ATTN`, `SAGE_ATTN_THREE`, or
+  `ATTN_QAT_INFER`, or `ATTN_QAT_TRAIN`)
+
+## Layer-by-Layer Activation Tracing
+
+For numerical-divergence debugging — typically when porting a new model and
+needing to find the first layer where FastVideo and an upstream reference
+produce different outputs — use the env-gated activation trace mode:
+
+```bash
+FASTVIDEO_TRACE_ACTIVATIONS=1 \
+FASTVIDEO_TRACE_LAYERS="^transformer\.blocks\.\d+$" \
+FASTVIDEO_TRACE_OUTPUT=/tmp/fv_trace.jsonl \
+python your_script.py
+```
+
+The trace dumps per-tensor stats (`abs_mean`, `sum`, `shape`, etc.) to a
+JSONL file. Run the same workload with tracing on the upstream side, then
+`diff` the two files to localize the first divergent layer.
+
+See [Activation Trace Mode](../contributing/activation_trace.md) for the
+full guide (env var reference, JSONL output schema, parity-debug workflow,
+performance impact, and troubleshooting).
 
 ## Common Failure Modes
 
@@ -52,7 +74,16 @@ If forcing a backend fails, verify optional dependencies are installed:
 - `VIDEO_SPARSE_ATTN`: `fastvideo-kernel`
 - `SLIDING_TILE_ATTN`: STA legacy workflow in
   `sta_do_not_delete` + `fastvideo-kernel`
-- `SAGE_ATTN` / `SAGE_ATTN_THREE`: SageAttention packages
+- `SAGE_ATTN`: SageAttention package
+- `SAGE_ATTN_THREE`: upstream `sageattn3` package
+- `ATTN_QAT_INFER`: `fastvideo-kernel` checkout/source install that exposes
+  `attn_qat_infer`, AND a consumer-Blackwell (sm_120/sm_121) GPU -- on any
+  other device the backend reports unavailable (even if a CUDA 13 wheel
+  bundles the extension) and selection falls back to FlashAttention
+- `ATTN_QAT_TRAIN`: `fastvideo-kernel`; its runtime-JIT Triton implementation
+  selects an optimized route on SM100, joins the quantized and STE P@V paths on
+  SM120, and retains the previous route for unsupported configurations. See
+  [Attn-QAT Training](../training/attn_qat.md) for architecture controls.
 
 As a fallback, use:
 

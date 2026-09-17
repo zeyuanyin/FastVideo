@@ -55,7 +55,13 @@ class DMD2Method(TrainingMethod):
             raise ValueError("DMD2Method requires critic to be trainable")
         self._cfg_uncond = self._parse_cfg_uncond()
         self._rollout_mode = self._parse_rollout_mode()
+        self._validate_preprocessed_data_type()
+        self._configure_student_negative_conditioning()
         self._denoising_step_list: torch.Tensor | None = (None)
+        (
+            self._score_min_timestep,
+            self._score_max_timestep,
+        ) = self._parse_score_timestep_bounds()
 
         # Initialize preprocessors on student.
         self.student.init_preprocessors(self.training_config)
@@ -206,6 +212,13 @@ class DMD2Method(TrainingMethod):
         return targets
 
     def _parse_rollout_mode(self, ) -> Literal["simulate", "data_latent"]:
+        """Parse how DMD2 obtains the latent point used for rollout.
+
+        ``simulate`` starts from fresh noise and lets the student create an
+        artificial latent trajectory, so it can run with text-only data.
+        ``data_latent`` starts from preprocessed VAE latents and perturbs them
+        at a sampled denoising timestep.
+        """
         raw = self.method_config.get("rollout_mode", None)
         if raw is None:
             raise ValueError("method_config.rollout_mode must be set "
@@ -222,6 +235,34 @@ class DMD2Method(TrainingMethod):
         raise ValueError("method_config.rollout_mode must be one of "
                          "{simulate, data_latent}, got "
                          f"{raw!r}")
+
+    def _validate_preprocessed_data_type(self) -> None:
+        data_type = str(getattr(
+            self.training_config.data,
+            "preprocessed_data_type",
+            "t2v",
+        )).strip().lower()
+        if data_type == "text_only" and self._rollout_mode != "simulate":
+            raise ValueError("training.data.preprocessed_data_type='text_only' "
+                             "requires method.rollout_mode='simulate'; "
+                             "data_latent rollout requires vae_latent data.")
+
+    def _uses_negative_prompt_conditioning(self) -> bool:
+        if self._cfg_uncond is None:
+            return True
+        text_policy = self._cfg_uncond.get("text", None)
+        if text_policy is None:
+            return True
+        return str(text_policy).strip().lower() == "negative_prompt"
+
+    def _configure_student_negative_conditioning(self) -> None:
+        setter = getattr(
+            self.student,
+            "set_requires_negative_conditioning",
+            None,
+        )
+        if setter is not None:
+            setter(self._uses_negative_prompt_conditioning())
 
     def _parse_cfg_uncond(self, ) -> dict[str, Any] | None:
         raw = self.method_config.get("cfg_uncond", None)
@@ -390,6 +431,51 @@ class DMD2Method(TrainingMethod):
         )
         return step_list[index]
 
+    def _parse_score_timestep_bounds(self) -> tuple[int, int]:
+        """Resolve the score-model timestep window used by legacy DMD.
+
+        The student rollout schedule is controlled separately by
+        ``dmd_denoising_steps``. These bounds apply only to the randomly
+        sampled teacher/critic score timestep.
+        """
+        min_ratio = get_optional_float(
+            self.method_config,
+            "min_timestep_ratio",
+            where="method.min_timestep_ratio",
+        )
+        max_ratio = get_optional_float(
+            self.method_config,
+            "max_timestep_ratio",
+            where="method.max_timestep_ratio",
+        )
+        min_ratio = 0.0 if min_ratio is None else float(min_ratio)
+        max_ratio = 1.0 if max_ratio is None else float(max_ratio)
+        if not 0.0 <= min_ratio <= max_ratio <= 1.0:
+            raise ValueError("method min/max_timestep_ratio must satisfy "
+                             "0 <= min <= max <= 1, got "
+                             f"min={min_ratio}, max={max_ratio}")
+
+        num_timesteps = int(self.student.num_train_timesteps)
+        return (
+            int(min_ratio * num_timesteps),
+            int(max_ratio * num_timesteps),
+        )
+
+    def _sample_score_timestep(self, device: torch.device) -> torch.Tensor:
+        timestep = torch.randint(
+            0,
+            int(self.student.num_train_timesteps),
+            [1],
+            device=device,
+            dtype=torch.long,
+            generator=self.cuda_generator,
+        )
+        timestep = self.student.shift_and_clamp_timestep(timestep)
+        return timestep.clamp(
+            self._score_min_timestep,
+            self._score_max_timestep,
+        )
+
     def _student_rollout(
         self,
         batch: Any,
@@ -520,15 +606,7 @@ class DMD2Method(TrainingMethod):
             generator_pred_x0 = self._student_rollout(batch, with_grad=False)
 
         device = generator_pred_x0.device
-        fake_score_timestep = torch.randint(
-            0,
-            int(self.student.num_train_timesteps),
-            [1],
-            device=device,
-            dtype=torch.long,
-            generator=self.cuda_generator,
-        )
-        fake_score_timestep = (self.student.shift_and_clamp_timestep(fake_score_timestep))
+        fake_score_timestep = self._sample_score_timestep(device)
 
         noise = torch.randn(
             generator_pred_x0.shape,
@@ -575,15 +653,7 @@ class DMD2Method(TrainingMethod):
         device = generator_pred_x0.device
 
         with torch.no_grad():
-            timestep = torch.randint(
-                0,
-                int(self.student.num_train_timesteps),
-                [1],
-                device=device,
-                dtype=torch.long,
-                generator=self.cuda_generator,
-            )
-            timestep = (self.student.shift_and_clamp_timestep(timestep))
+            timestep = self._sample_score_timestep(device)
 
             noise = torch.randn(
                 generator_pred_x0.shape,

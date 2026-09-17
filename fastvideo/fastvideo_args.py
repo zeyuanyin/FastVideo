@@ -4,6 +4,7 @@
 import argparse
 import dataclasses
 import json
+import math
 from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
@@ -24,6 +25,17 @@ else:
     PlacementGroup = Any
 
 logger = init_logger(__name__)
+
+# Offload flags that trade device memory for host memory. All of them are a loss
+# on a device where the two are the same physical pool. Keeping the policy
+# centralized lets every loader and stage share one worker-local decision.
+UNIFIED_MEMORY_OFFLOAD_FLAGS = (
+    "dit_layerwise_offload",
+    "dit_cpu_offload",
+    "text_encoder_cpu_offload",
+    "image_encoder_cpu_offload",
+    "vae_cpu_offload",
+)
 
 
 class ExecutionMode(str, Enum):
@@ -61,6 +73,8 @@ class WorkloadType(str, Enum):
     T2V = "t2v"  # Text to Video
     T2I = "t2i"  # Text to Image
     I2I = "i2i"  # Image to Image
+    V2A = "v2a"  # Video to Audio
+    T2A = "t2a"  # Text to Audio
 
     @classmethod
     def from_string(cls, value: str) -> "WorkloadType":
@@ -117,11 +131,24 @@ class FastVideoArgs:
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+    lora_strength: float = 1.0
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
 
     output_type: str = "pil"
+
+    # The attention backend requested for this run. Applied per component at
+    # load time (each component resolves its own decision, recorded on its
+    # config); a role-level request (the train stack's per-role
+    # attention_backend) overrides it.
+    #
+    # This field is the parse-once adapter for FASTVIDEO_ATTENTION_BACKEND:
+    # when left unset it takes the env var's value in __post_init__, so the
+    # environment is an *input* read once here rather than something the loader
+    # consults later. None means no request: per-layer defaults, then platform
+    # auto-selection.
+    attention_backend: str | None = None
 
     # CPU offload parameters
     dit_cpu_offload: bool = True
@@ -132,14 +159,81 @@ class FastVideoArgs:
     vae_cpu_offload: bool = True
     pin_cpu_memory: bool = True
 
+    # MiniMax-H3 inference load order. ``None`` (auto) defers DiT/VAE load until
+    # after the Qwen3-VL encoder is released, but only on unified-memory
+    # devices (GB10 / Spark). Discrete GPUs keep the encoder resident so a
+    # later ``generate()`` on the same worker can re-encode. Explicit True /
+    # False overrides the probe. Training never defers.
+    h3_sequential_load: bool | None = None
+
+    # MiniMax-H3 video reconstruction. ``h3-vae`` is the full ViT decoder.
+    # ``taeh3`` is Ollin Boer Bohan's tiny preview decoder; it changes quality
+    # and is opt-in. T2VA with TAEH3 does not need the video VAE weights.
+    video_decode_backend: str = "h3-vae"
+    taeh3_checkpoint: str | None = None
+    taeh3_chunk_size: int = 5
+
+    # Load each heavy component on first use and free it once the last stage
+    # that holds it has run, instead of keeping every component resident from
+    # load time to shutdown. Peak memory becomes the largest overlapping set
+    # rather than the sum of all components. ``None`` (auto) turns this on for
+    # unified-memory devices (GB10 / Spark) after the worker binds its device,
+    # and leaves it off on discrete GPUs. Explicit True / False overrides the
+    # probe. A released component is re-read from disk on the next generation,
+    # so this trades per-request latency for headroom. Inference only; training
+    # keeps every component resident.
+    lazy_module_load: bool | None = None
+
+    # Sequence-parallel MiniMax-H3 VAE (opt-in, default off). With SP > 1 the
+    # video VAE's temporal chunks (decode) and clips (reference encode) are
+    # round-robined across the sequence-parallel ranks and reassembled
+    # bit-exactly on the group's first rank instead of running serially on
+    # one rank while the others idle. ``__post_init__`` folds the
+    # FASTVIDEO_VAE_PARALLEL_DECODE / FASTVIDEO_VAE_PARALLEL_ENCODE env vars
+    # into these fields (parse-once, like attention_backend), and
+    # FASTVIDEO_VAE_PARALLEL_DECODE_STRATEGY overrides the chunk-transport
+    # collective ("gather" or "all_gather").
+    vae_parallel_decode: bool = False
+    vae_parallel_encode: bool = False
+    vae_parallel_decode_strategy: str | None = None
+
     # Compilation
+    # ``enable_torch_compile`` covers the DiT path (transformer,
+    # transformer_2, and the LTX-2 stage-2 transformer_refine).
+    # Per-component flags below let callers compile additional submodules
+    # independently; ``False`` leaves the component eager.
     enable_torch_compile: bool = False
+    enable_torch_compile_text_encoder: bool = False
+    enable_torch_compile_vae: bool = False
+    enable_torch_compile_audio_vae: bool = False
+    # ``torch_compile_kwargs`` is the master kwargs dict (applied to every
+    # compiled submodule unless a per-component dict below is non-empty,
+    # in which case the per-component dict overrides entirely — matching
+    # the FastVideo-internal precedent).
     torch_compile_kwargs: dict[str, Any] = field(default_factory=dict)
+    torch_compile_kwargs_dit: dict[str, Any] = field(default_factory=dict)
+    torch_compile_kwargs_text_encoder: dict[str, Any] = field(default_factory=dict)
+    torch_compile_kwargs_vae: dict[str, Any] = field(default_factory=dict)
+    torch_compile_kwargs_audio_vae: dict[str, Any] = field(default_factory=dict)
+    # Regional (per-transformer-block) fullgraph torch.compile of the DiT at
+    # inference — the inference-side counterpart of the training regional
+    # compile ported from hao-ai-lab/FastVideo#1718. Applied by the loader
+    # right after the transformer loads, with fullgraph=True and inductor
+    # options {emulate_precision_casts: True} injected (no user kwargs
+    # needed). MiniMax-H3 VSA is supported only by its compile-safe sm_100a
+    # tile-64 inference route; other VSA routes degrade the transformer to
+    # eager with one warning. Dense FA2/FA3/FA4 inference uses compile-visible
+    # custom-op boundaries. Opt-in via FASTVIDEO_INFERENCE_TORCH_COMPILE=1 (folded in
+    # __post_init__) or PipelineSelection.experimental
+    # {"inference_torch_compile": true}. Distinct from ``enable_torch_compile``,
+    # which keeps the pipeline-level compile semantics.
+    inference_torch_compile: bool = False
 
     disable_autocast: bool = False
 
     # VSA parameters
     VSA_sparsity: float = 0.0  # inference/validation sparsity
+    VSA_tile_size: int = 256  # VSA-H3 tile size (256 or 64); 64 = native Triton path
 
     # V-MoBA parameters
     moba_config_path: str | None = None
@@ -161,6 +255,38 @@ class FastVideoArgs:
     ltx2_vae_temporal_tile_size_in_frames: int | None = None
     ltx2_vae_temporal_tile_overlap_in_frames: int | None = None
     ltx2_initial_latent_path: str | None = None
+    ltx2_audio_latent_path: str | None = None
+    # Generic stage-2 refine surface (preferred user-facing API). The
+    # ltx2_refine_* fields below remain the runtime carriers; these
+    # generic ones let CLI / typed-config callers set the same values
+    # without binding to a specific model family. ``None`` here means
+    # "fall back to the model_index.json default and/or the
+    # ltx2_refine_* runtime carrier".
+    refine_enabled: bool | None = None
+    refine_upsampler_path: str | None = None
+    refine_transformer_path: str | None = None
+    refine_lora_path: str | None = None
+    refine_num_inference_steps: int | None = None
+    refine_guidance_scale: float | None = None
+    refine_add_noise: bool | None = None
+    refine_noise_path: str | None = None
+    refine_audio_noise_path: str | None = None
+    # LTX-2 stage-2 spatial refinement (the SR pipeline). When enabled the
+    # transformer runs once at half resolution, the latents are upsampled
+    # by the LTX2 latent upsampler, then a short stage-2 distilled
+    # denoising pass refines the upsampled latents. Behaviour is opt-in
+    # and isolated to LTX-2 today.
+    ltx2_refine_enabled: bool = False
+    ltx2_refine_upsampler_path: str | None = None
+    ltx2_refine_transformer_path: str | None = None
+    ltx2_refine_lora_path: str | None = None
+    ltx2_refine_num_inference_steps: int = 3
+    ltx2_refine_guidance_scale: float = 1.0
+    ltx2_refine_add_noise: bool = True
+    ltx2_refine_noise_path: str | None = None
+    ltx2_refine_audio_noise_path: str | None = None
+    ltx2_legacy_native_noise_order: bool = False
+    ltx2_use_distilled_sigmas: bool = True
 
     # model paths for correct deallocation
     model_paths: dict[str, str] = field(default_factory=dict)
@@ -172,6 +298,15 @@ class FastVideoArgs:
 
     override_text_encoder_safetensors: str | None = None  # path to safetensors file for text encoder override
     override_text_encoder_quant: QuantizationMethods = None
+    # Typed transformer quantization carrier. The typed inference API
+    # accepts ``engine.quantization.transformer_quant: "NVFP4"`` and the
+    # compat layer resolves the name to a concrete ``QuantizationConfig``
+    # instance (e.g. ``NVFP4Config()``); ``__post_init__`` then pins it on
+    # ``pipeline_config.dit_config.quant_config`` so the loader can detect
+    # FP4 layers via the standard ``get_quant_method`` path. ``None``
+    # leaves whatever value the caller already set on ``dit_config``
+    # untouched.
+    transformer_quant: Any | None = None
 
     override_transformer_cls_name: str | None = None
     init_weights_from_safetensors: str = ""  # path to safetensors file for initial weight loading
@@ -190,6 +325,8 @@ class FastVideoArgs:
         return not self.inference_mode
 
     def __post_init__(self):
+        if not math.isfinite(self.lora_strength):
+            raise ValueError(f"lora_strength must be finite, got {self.lora_strength}")
         if self.moba_config_path:
             try:
                 with open(self.moba_config_path) as f:
@@ -199,7 +336,97 @@ class FastVideoArgs:
                 logger.error("Failed to load V-MoBA config from %s: %s", self.moba_config_path, e)
                 raise
         self._apply_ltx2_vae_overrides()
+        self._resolve_refine_args()
+        self._apply_transformer_quant()
+        if not self.inference_torch_compile:
+            # Parse-once adapter (same pattern as attention_backend below): the
+            # environment variable is an input read once here, so the loader
+            # only ever consults the typed field.
+            import fastvideo.envs as envs
+            if envs.FASTVIDEO_INFERENCE_TORCH_COMPILE:
+                self.inference_torch_compile = True
+        if self.attention_backend is not None:
+            # Fail fast on typos instead of silently auto-selecting later.
+            from fastvideo.attention.selector import coerce_attn_backend
+            coerce_attn_backend(self.attention_backend)
+        else:
+            # Parse-once adapter: fold the environment variable into the typed
+            # request so resolution has a single input and library code never
+            # consults the environment on the load path. The env var keeps its
+            # historically permissive parse — an unknown name is ignored here
+            # and falls through to automatic selection rather than raising.
+            import fastvideo.envs as envs
+            from fastvideo.attention.selector import backend_name_to_enum
+            env_backend = envs.FASTVIDEO_ATTENTION_BACKEND
+            if env_backend is not None and backend_name_to_enum(env_backend) is not None:
+                self.attention_backend = env_backend
+        self._fold_vae_parallel_env()
         self.check_fastvideo_args()
+
+    def _fold_vae_parallel_env(self) -> None:
+        """Parse-once adapters for the sequence-parallel VAE env vars."""
+        import fastvideo.envs as envs
+
+        # Mirrors fastvideo.models.vaes.minimax_h3_parallel.DECODE_GATHER_STRATEGIES /
+        # DEFAULT_DECODE_GATHER_STRATEGY (kept literal here so constructing args
+        # never imports model modules; a unit test pins the two in sync).
+        strategies = ("gather", "all_gather")
+        if not self.vae_parallel_decode and envs.FASTVIDEO_VAE_PARALLEL_DECODE:
+            self.vae_parallel_decode = True
+        if not self.vae_parallel_encode and envs.FASTVIDEO_VAE_PARALLEL_ENCODE:
+            self.vae_parallel_encode = True
+        if self.vae_parallel_decode_strategy is None:
+            self.vae_parallel_decode_strategy = envs.FASTVIDEO_VAE_PARALLEL_DECODE_STRATEGY or "gather"
+        if self.vae_parallel_decode_strategy not in strategies:
+            raise ValueError(f"vae_parallel_decode_strategy must be one of {strategies}, "
+                             f"got {self.vae_parallel_decode_strategy!r}.")
+
+    def _apply_transformer_quant(self) -> None:
+        """Pin the typed ``transformer_quant`` instance onto ``dit_config``.
+
+        ``transformer_quant`` is populated by the typed compat layer when
+        a caller writes ``engine.quantization.transformer_quant: "NVFP4"``
+        in their config. We pin it here rather than at request time so
+        the model loader sees the quant_config when constructing the
+        DiT (linear layers attach their quant_method during ``__init__``).
+        """
+        if self.transformer_quant is None or self.pipeline_config is None:
+            return
+        dit_config = getattr(self.pipeline_config, "dit_config", None)
+        if dit_config is None:
+            return
+        # Resolve a registry name (e.g. "nvfp4_qat_train" from the CLI) to a
+        # QuantizationConfig instance; a bare string has no get_quant_method.
+        tq = self.transformer_quant
+        if isinstance(tq, str):
+            from fastvideo.layers.quantization import get_quantization_config
+            tq = get_quantization_config(tq)()
+        # Don't overwrite if the caller already set it explicitly on
+        # dit_config (e.g. via ``pipeline_config.dit_config.quant_config = NVFP4Config()``);
+        # the explicit setter wins.
+        if getattr(dit_config, "quant_config", None) is None:
+            dit_config.quant_config = tq
+
+    def _resolve_refine_args(self) -> None:
+        """Map generic refine_* args to LTX-2-specific refine fields."""
+        if self.refine_enabled is not None:
+            self.ltx2_refine_enabled = self.refine_enabled
+        if self.refine_upsampler_path is not None:
+            self.ltx2_refine_upsampler_path = self.refine_upsampler_path
+        if self.refine_transformer_path is not None:
+            self.ltx2_refine_transformer_path = self.refine_transformer_path
+        if self.refine_lora_path is not None:
+            self.ltx2_refine_lora_path = self.refine_lora_path
+        if self.refine_num_inference_steps is not None:
+            self.ltx2_refine_num_inference_steps = self.refine_num_inference_steps
+        if self.refine_guidance_scale is not None:
+            self.ltx2_refine_guidance_scale = self.refine_guidance_scale
+        if self.refine_add_noise is not None:
+            self.ltx2_refine_add_noise = self.refine_add_noise
+        if self.refine_noise_path is not None:
+            self.ltx2_refine_noise_path = self.refine_noise_path
+        if self.refine_audio_noise_path is not None:
+            self.ltx2_refine_audio_noise_path = self.refine_audio_noise_path
 
     def _apply_ltx2_vae_overrides(self) -> None:
         if self.pipeline_config is None:
@@ -334,6 +561,17 @@ class FastVideoArgs:
             help="Output type for the generated video",
         )
 
+        # Attention backend (process-wide default request)
+        parser.add_argument(
+            "--attention-backend",
+            type=str,
+            default=FastVideoArgs.attention_backend,
+            help="Default attention backend request (e.g. FLASH_ATTN, TORCH_SDPA, "
+            "SAGE_ATTN). Applied per component at load time; component/role-level "
+            "requests override it. Unset: FASTVIDEO_ATTENTION_BACKEND env var, "
+            "then per-layer defaults, then automatic selection.",
+        )
+
         # Prompt text file for batch processing
         parser.add_argument(
             "--prompt-txt",
@@ -394,6 +632,12 @@ class FastVideoArgs:
             help="Nickname to refer to the loaded LoRA adapter (useful for swapping).",
         )
         parser.add_argument(
+            "--lora-strength",
+            type=float,
+            default=FastVideoArgs.lora_strength,
+            help="Scale applied to every part of the inference LoRA adapter (default: 1.0).",
+        )
+        parser.add_argument(
             "--lora-target-modules",
             nargs="+",
             type=str,
@@ -446,6 +690,15 @@ class FastVideoArgs:
             help=
             "JSON string of kwargs to pass to torch.compile. Example: '{\"backend\":\"inductor\",\"mode\":\"reduce-overhead\"}'",
         )
+        parser.add_argument(
+            "--inference-torch-compile",
+            action=StoreBoolean,
+            default=FastVideoArgs.inference_torch_compile,
+            help="Regional fullgraph torch.compile of each DiT transformer block at inference "
+            "(port of the #1718 training-side regional compile). The loader injects fullgraph=True "
+            "and inductor options {emulate_precision_casts: true}; non-traceable attention backends "
+            "(VSA) degrade to eager with one warning. FASTVIDEO_INFERENCE_TORCH_COMPILE=1 is equivalent.",
+        )
 
         parser.add_argument(
             "--dit-cpu-offload",
@@ -480,11 +733,59 @@ class FastVideoArgs:
             help="Use CPU offload for VAE. Enable if run out of memory.",
         )
         parser.add_argument(
+            "--lazy-module-load",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Load each heavy component on first use and free it after the last stage that needs it, "
+            "so peak memory is the largest overlapping set of components instead of their sum. "
+            "Omit for auto (on for unified-memory devices such as GB10; off on discrete GPUs). "
+            "Pass --no-lazy-module-load to keep every component resident.",
+        )
+        parser.add_argument(
             "--pin-cpu-memory",
             action=StoreBoolean,
             help=
             "Pin memory for CPU offload. Only added as a temp workaround if it throws \"CUDA error: invalid argument\". "
             "Should be enabled in almost all cases",
+        )
+        parser.add_argument(
+            "--h3-sequential-load",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="MiniMax-H3: encode with Qwen3-VL, release that encoder, then load DiT and VAEs. "
+            "Omit for auto (on for unified-memory devices such as GB10; off on discrete GPUs). "
+            "Pass --no-h3-sequential-load to keep the encoder resident for later generate() calls.",
+        )
+        parser.add_argument(
+            "--video-decode-backend",
+            type=str,
+            choices=("h3-vae", "taeh3"),
+            default=FastVideoArgs.video_decode_backend,
+            help="MiniMax-H3 video decoder. taeh3 is a fast approximate preview decoder; h3-vae is the full VAE.",
+        )
+        parser.add_argument(
+            "--taeh3-checkpoint",
+            type=str,
+            default=None,
+            help="Local taeh3.safetensors path. Unset downloads the pinned upstream weights into the cache.",
+        )
+        parser.add_argument(
+            "--taeh3-chunk-size",
+            type=int,
+            default=FastVideoArgs.taeh3_chunk_size,
+            help="TAEH3 latent frames per execution chunk.",
+        )
+        parser.add_argument(
+            "--vae-parallel-decode",
+            action=StoreBoolean,
+            help="With sequence parallelism, round-robin MiniMax-H3 VAE decode chunks across the SP ranks "
+            "and reassemble bit-exactly on the output rank (default: serial decode on the output rank)",
+        )
+        parser.add_argument(
+            "--vae-parallel-encode",
+            action=StoreBoolean,
+            help="With sequence parallelism, round-robin MiniMax-H3 reference-video VAE encode clips across "
+            "the SP ranks; every rank keeps the identical full encoding (default: serial encode on every rank)",
         )
         parser.add_argument(
             "--disable-autocast",
@@ -498,6 +799,12 @@ class FastVideoArgs:
             type=float,
             default=FastVideoArgs.VSA_sparsity,
             help="Validation sparsity for VSA",
+        )
+        parser.add_argument(
+            "--VSA-tile-size",
+            type=int,
+            default=FastVideoArgs.VSA_tile_size,
+            help="VSA-H3 tile size in tokens (256 or 64); 64 runs the native Triton block-sparse path",
         )
 
         # Master port for distributed training/inference
@@ -625,20 +932,6 @@ class FastVideoArgs:
 
     def check_fastvideo_args(self) -> None:
         """Validate inference arguments for consistency"""
-        from fastvideo.platforms import current_platform
-
-        if current_platform.is_mps():
-            self.use_fsdp_inference = False
-            self.dit_layerwise_offload = False
-
-        if self.dit_layerwise_offload:
-            if self.use_fsdp_inference:
-                logger.warning("dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference.")
-                self.use_fsdp_inference = False
-            if self.dit_cpu_offload:
-                logger.warning("dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload.")
-                self.dit_cpu_offload = False
-
         # Validate mode and inference_mode consistency
         assert isinstance(self.mode, ExecutionMode), f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
         assert self.mode in ExecutionMode.choices(), f"Invalid execution mode: {self.mode}"
@@ -654,6 +947,14 @@ class FastVideoArgs:
         elif self.mode in [ExecutionMode.INFERENCE, ExecutionMode.PREPROCESS] and not self.inference_mode:
             logger.warning("Mode is '%s' but inference_mode is False. Setting inference_mode to True.", self.mode)
             self.inference_mode = True
+
+        # Inference policy must wait until a worker owns and binds its device:
+        # a unified-memory device disables layerwise offload before conflicts
+        # are resolved, preserving an explicit FSDP request. Training does not
+        # pass through the inference worker boundary, so retain its historical
+        # constructor-time normalization.
+        if not self.inference_mode:
+            self._resolve_device_offload_conflicts()
 
         if not self.inference_mode:
             assert self.hsdp_replicate_dim != -1, "hsdp_replicate_dim must be set for training"
@@ -688,6 +989,84 @@ class FastVideoArgs:
             if not self.pipeline_config.vae_config.load_encoder:
                 self.pipeline_config.vae_config.load_encoder = True
             self.preprocess_config.check_preprocess_config()
+
+    def _resolve_device_offload_conflicts(self) -> None:
+        """Resolve offload modes after device-local policy has been applied."""
+        from fastvideo.platforms import current_platform
+
+        if current_platform.is_mps():
+            self.use_fsdp_inference = False
+            self.dit_layerwise_offload = False
+
+        if self.dit_layerwise_offload:
+            if self.use_fsdp_inference:
+                logger.warning("dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference.")
+                self.use_fsdp_inference = False
+            if self.dit_cpu_offload:
+                logger.warning("dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload.")
+                self.dit_cpu_offload = False
+
+    def finalize_device_offload_policy(self, device_id: int = 0) -> bool:
+        """Apply device-local memory policy, then resolve incompatible modes."""
+        has_unified_memory = self.disable_offload_on_unified_memory(device_id)
+        if self.lazy_module_load is None:
+            self.lazy_module_load = bool(has_unified_memory) and not self.training_mode
+            if self.lazy_module_load:
+                from fastvideo.platforms import current_platform
+
+                try:
+                    device_name = current_platform.get_device_name(device_id)
+                except Exception:
+                    device_name = current_platform.device_name
+                logger.info(
+                    "Enabling lazy_module_load: %s has unified memory, so encoder, DiT, and VAEs cannot stay "
+                    "resident together. Pass --no-lazy-module-load to keep every component loaded.",
+                    device_name,
+                )
+        self._resolve_device_offload_conflicts()
+        return has_unified_memory
+
+    def disable_offload_on_unified_memory(self, device_id: int = 0, *, offload_flag: str | None = None) -> bool:
+        """Disable host offload after a worker has selected its device.
+
+        CUDA's unified-memory probe reads runtime device properties and may
+        initialize a CUDA context. Callers must therefore use this only inside
+        a device-owning process, after selecting and binding ``device_id``.
+        Returning the classification lets direct component-loader callers
+        apply the same policy to explicit per-call overrides. When
+        ``offload_flag`` is given, the return value says whether this policy
+        covers that component role.
+        """
+        from fastvideo.platforms import current_platform
+
+        cached_device_id = getattr(self, "_unified_memory_device_id", None)
+        cached_result = getattr(self, "_unified_memory_result", None)
+        if cached_device_id != device_id or cached_result is None:
+            cached_result = current_platform.has_unified_memory(device_id)
+            self._unified_memory_device_id = device_id
+            self._unified_memory_result = cached_result
+
+        if not cached_result:
+            return False
+
+        enabled_flags = [flag for flag in UNIFIED_MEMORY_OFFLOAD_FLAGS if getattr(self, flag)]
+        if enabled_flags:
+            try:
+                device_name = current_platform.get_device_name(device_id)
+            except Exception:
+                # Device naming is diagnostic only. NVML can be unavailable on
+                # an integrated GPU (for example Jetson), and its physical-
+                # ordinal lookup cannot interpret CUDA_VISIBLE_DEVICES UUID/MIG
+                # selectors. Neither case should undo an authoritative driver
+                # classification.
+                device_name = current_platform.device_name
+
+            for flag in enabled_flags:
+                logger.info(
+                    "Disabling %s: %s has unified memory, so moving weights to the host duplicates "
+                    "them rather than freeing device memory.", flag, device_name)
+                setattr(self, flag, False)
+        return offload_flag is None or offload_flag in UNIFIED_MEMORY_OFFLOAD_FLAGS
 
 
 _current_fastvideo_args = None
@@ -832,6 +1211,12 @@ class TrainingArgs(FastVideoArgs):
     # VSA training decay parameters
     VSA_decay_rate: float = 0.01  # decay rate -> 0.02
     VSA_decay_interval_steps: int = 1  # decay interval steps -> 50
+    # Reuse the per-step padded VSA tile buffer across attention layers during
+    # training. Defaults to False: under full activation checkpointing the
+    # cached buffer survives into the backward recompute and inflates peak
+    # memory (see #1423). Enable on memory-rich setups to keep the per-step
+    # buffer-reuse speedup.
+    VSA_cache_tile_buf: bool = False
 
     # LoRA training parameters
     lora_rank: int | None = None
@@ -844,6 +1229,13 @@ class TrainingArgs(FastVideoArgs):
     dfake_gen_update_ratio: int = 5  # self-forcing: how often to train generator vs critic
     min_timestep_ratio: float = 0.2
     max_timestep_ratio: float = 0.98
+    # CFG scale applied to the real (teacher) score in the DMD loss, using the
+    # parameterization `x = x_cond + w * (x_cond - x_uncond)`. This differs
+    # from the Ho & Salimans form `x_uncond + w * (x_cond - x_uncond)` by an
+    # offset of 1: `w_here = w_standard - 1`. So `w=0` recovers the
+    # conditional output, `w=-1` recovers the unconditional output, and the
+    # default 3.5 corresponds to a standard CFG scale of 4.5. Matches the
+    # original DMD2 reference implementation.
     real_score_guidance_scale: float = 3.5
     fake_score_learning_rate: float = 0.0  # separate learning rate for fake_score_transformer, if 0.0, use learning_rate
     fake_score_lr_scheduler: str = "constant"  # separate lr scheduler for fake_score_transformer, if not set, use lr_scheduler
@@ -912,6 +1304,12 @@ class TrainingArgs(FastVideoArgs):
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         parser.add_argument("--data-path", type=str, required=True, help="Path to parquet files")
+        parser.add_argument("--transformer-quant",
+                            type=str,
+                            default=None,
+                            help="Quantization config name for the DiT (e.g. nvfp4_qat_train for "
+                            "QAT-finetune FP4 linear with a straight-through estimator). "
+                            "Resolved to a QuantizationConfig and pinned on dit_config.quant_config.")
         parser.add_argument("--dataloader-num-workers",
                             type=int,
                             required=True,
@@ -1065,6 +1463,13 @@ class TrainingArgs(FastVideoArgs):
             type=int,
             default=TrainingArgs.VSA_decay_interval_steps,
             help="VSA decay interval steps")
+        parser.add_argument("--VSA-cache-tile-buf",
+                            action=StoreBoolean,
+                            default=TrainingArgs.VSA_cache_tile_buf,
+                            help="Reuse the per-step padded VSA tile buffer across attention "
+                            "layers during training. Off by default to avoid the activation-"
+                            "checkpointing OOM (#1423); enable on memory-rich setups for the "
+                            "per-step buffer-reuse speedup.")
         parser.add_argument("--lora-training", action=StoreBoolean, help="Whether to use LoRA training")
         parser.add_argument("--lora-rank", type=int, help="LoRA rank")
         parser.add_argument("--lora-alpha", type=int, help="LoRA alpha")
@@ -1104,7 +1509,10 @@ class TrainingArgs(FastVideoArgs):
         parser.add_argument("--real-score-guidance-scale",
                             type=float,
                             default=TrainingArgs.real_score_guidance_scale,
-                            help="Teacher guidance scale")
+                            help=("Teacher CFG scale for the real score in the DMD loss. Uses "
+                                  "the parameterization x_cond + w * (x_cond - x_uncond), so "
+                                  "w=0 -> cond, w=-1 -> uncond, and the relation to standard "
+                                  "CFG is w_standard = w + 1 (default 3.5 == standard 4.5)."))
         parser.add_argument("--fake-score-learning-rate",
                             type=float,
                             default=TrainingArgs.fake_score_learning_rate,

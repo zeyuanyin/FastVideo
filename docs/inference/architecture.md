@@ -23,7 +23,7 @@ to FastVideo model classes. Two discovery mechanisms:
    `fastvideo/models/` and parses each `.py` file's AST looking for an
    `EntryClass` variable assignment. Discovered models take priority over
    hardcoded entries. For example,
-   `fastvideo/models/dits/wanvideo.py` exports
+   `fastvideo/models/wan/transformer.py` exports
    `EntryClass = WanTransformer3DModel`.
 
 Both feed into a unified `_FAST_VIDEO_MODELS` dict, which populates the
@@ -86,7 +86,7 @@ from `model_index.json`.
 
 ```
 PipelineConfig                    (fastvideo/configs/pipelines/base.py)
-├── WanT2V480PConfig              (fastvideo/configs/pipelines/wan.py)
+├── WanT2V480PConfig              (fastvideo/models/wan/pipeline_config.py)
 │   ├── WanT2V720PConfig
 │   └── WanI2V480PConfig
 ├── HunyuanConfig                 (fastvideo/configs/pipelines/hunyuan.py)
@@ -106,6 +106,11 @@ PipelineConfig                    (fastvideo/configs/pipelines/base.py)
 Model-specific subclasses override defaults. For example,
 `WanT2V480PConfig` sets `flow_shift=3.0` and uses `WanVideoConfig` as
 its DiT config.
+
+Wan's `models/wan/definition.py` links each registered variant to its pipeline
+config and sampling preset. The shared registry consumes these definitions
+without changing detector precedence or checkpoint/override-based pipeline
+selection. `configs/pipelines/wan.py` remains a compatibility import.
 
 ### ModelConfig / ArchConfig (`fastvideo/configs/models/base.py`)
 
@@ -128,19 +133,14 @@ Concrete hierarchy: `DiTConfig` → `DiTArchConfig`, `VAEConfig` →
 - `dump_to_json()` / `load_from_json()` — JSON persistence. Callable
   fields and `arch_config` are excluded from dumps.
 
-### SamplingParam (`fastvideo/configs/sample/`)
+### SamplingParam (`fastvideo/api/sampling_param.py`)
 
 Generation parameters separate from pipeline config. Each model family
-provides defaults:
+provides defaults via a profile (see `fastvideo/pipelines/basic/<family>/profiles.py`):
 
 ```python
-@dataclass
-class WanT2V_1_3B_SamplingParam(SamplingParam):
-    height: int = 480
-    width: int = 832
-    num_frames: int = 81
-    guidance_scale: float = 3.0
-    num_inference_steps: int = 50
+sp = SamplingParam.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+# sp.height == 480, sp.width == 832, sp.num_frames == 81, etc.
 ```
 
 ## Component Loading
@@ -231,7 +231,7 @@ Dataclass carrying all pipeline state between stages. Key field groups:
   `width_latents`.
 - **Scheduler**: `timesteps`, `num_inference_steps`, `guidance_scale`,
   `sigmas`.
-- **Task-specific**: `mouse_cond`/`keyboard_cond` (MatrixGame), `pose`
+- **Task-specific**: `mouse_cond`/`keyboard_cond` (Matrix-Game 2.0), `pose`
   (HYWorld), `camera_states` (GameCraft), `c2ws_plucker_emb`
   (LingBotWorld).
 - **Output**: `output: Tensor | None`.
@@ -257,9 +257,19 @@ Standard stages (typical execution order):
 
 Specialized variants: `CausalDenoisingStage`, `LTX2DenoisingStage`,
 `LongCatDenoisingStage`, `GameCraftDenoisingStage`,
-`HYWorldDenoisingStage`, `MatrixGameDenoisingStage`,
+`HYWorldDenoisingStage`, `MatrixGame2CausalDenoisingStage`,
 `SRDenoisingStage`, `LTX2AudioDecodingStage`, `SD35ConditioningStage`,
 `LTX2TextEncodingStage`, `LTX2LatentPreparationStage`.
+
+Wan owns its sampling recipes under `basic/wan/stages/`. `WanDenoisingStage`
+specializes input packing, expert selection, timesteps, and first-frame
+restoration around the shared dense loop. `WanFirstFrameEncodingStage`
+produces normalized `ForwardBatch.first_frame_latent` before sampling; the
+sampler no longer executes a VAE. Dense DMD and the two causal samplers have
+family-local implementations and explicit scheduler ownership. Standard and
+DMD causal sampling share cache allocation, not their sampling algorithm.
+Legacy imports from `stages/` remain compatibility aliases. Sampling invariants
+also live beside the code in `fastvideo/pipelines/basic/wan/AGENTS.md`.
 
 ### Verification System (`fastvideo/pipelines/stages/validators.py`)
 
@@ -430,9 +440,9 @@ User: generator.generate_video(prompt, ...)
    `fastvideo/configs/pipelines/<model>.py`. Set DiT/VAE/encoder configs,
    flow_shift, precision defaults.
 
-2. **Sampling param** — Create a `SamplingParam` subclass in
-   `fastvideo/configs/sample/<model>.py`. Set default height, width,
-   num_frames, guidance_scale, num_inference_steps.
+2. **Sampling param profile** — Create a profile in
+   `fastvideo/pipelines/basic/<model>/profiles.py` with default height,
+   width, num_frames, guidance_scale, num_inference_steps.
 
 3. **Register configs** — In `fastvideo/registry.py`, add a
    `register_configs()` call inside `_register_configs()` with
@@ -455,6 +465,6 @@ User: generator.generate_video(prompt, ...)
    `fastvideo/pipelines/stages/`, implement `forward()`, optionally
    implement `verify_input()`/`verify_output()`.
 
-7. **Verify** — Run `fastvideo generate --model-path <path> --prompt
-   "test" --num-inference-steps 2` to confirm the pipeline loads and
-   generates output.
+7. **Verify** — Run `fastvideo generate --config <config.yaml>` with a
+   minimal nested config to confirm the pipeline loads and generates
+   output.

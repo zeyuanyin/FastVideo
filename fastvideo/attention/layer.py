@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+from functools import wraps
+
 import torch
 import torch.nn as nn
 
@@ -11,6 +14,47 @@ from fastvideo.forward_context import ForwardContext, get_forward_context
 from fastvideo.platforms import AttentionBackendEnum
 from fastvideo.utils import get_compute_dtype
 from fastvideo.layers.rotary_embedding import _apply_rotary_emb
+
+
+def _attention_compile_disabled() -> bool:
+    """Whether to keep attention ``forward`` out of the torch.compile graph.
+
+    Defaults to ``True`` (the historical behavior: attention runs eager via
+    ``torch.compiler.disable``). Set ``FASTVIDEO_DISABLE_ATTENTION_COMPILE=0``
+    to let attention instances constructed under that environment be traced.
+    """
+    val = os.environ.get("FASTVIDEO_DISABLE_ATTENTION_COMPILE")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _attention_compile_explicitly_disabled() -> bool:
+    """Whether the environment explicitly requests the eager boundary.
+
+    Regional compile can override the historical default for one loaded
+    transformer, but it must still honor an explicit debugging escape hatch.
+    """
+    return "FASTVIDEO_DISABLE_ATTENTION_COMPILE" in os.environ and _attention_compile_disabled()
+
+
+def _maybe_compiler_disable(fn):
+    """Defer the eager/traceable choice to each attention instance.
+
+    A class-definition-time choice makes a process-wide default the only
+    option. The deferred wrapper keeps ordinary instances on the historical
+    eager boundary while allowing the regional loader to opt in only the
+    attention modules owned by the transformer it is compiling.
+    """
+    disabled_fn = torch.compiler.disable(fn)
+
+    @wraps(fn)
+    def _dispatch(self, *args, **kwargs):
+        if self._compile_forward_enabled:
+            return fn(self, *args, **kwargs)
+        return disabled_fn(self, *args, **kwargs)
+
+    return _dispatch
 
 
 class DistributedAttention(nn.Module):
@@ -55,8 +99,15 @@ class DistributedAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.backend = backend_name_to_enum(attn_backend.get_name())
         self.dtype = dtype
+        # Preserve the historical compiler-disabled default. The regional
+        # inference loader may enable this one instance after validating the
+        # transformer's resolved backend; no process-global default changes.
+        self._compile_forward_enabled = not _attention_compile_disabled()
 
-    @torch.compiler.disable
+    def _set_compile_forward_enabled(self, enabled: bool) -> None:
+        self._compile_forward_enabled = enabled
+
+    @_maybe_compiler_disable
     def forward(
         self,
         q: torch.Tensor,
@@ -146,7 +197,7 @@ class DistributedAttention_VSA(DistributedAttention):
     """Distributed attention layer with VSA support.
     """
 
-    @torch.compiler.disable
+    @_maybe_compiler_disable
     def forward(
         self,
         q: torch.Tensor,
@@ -185,11 +236,13 @@ class DistributedAttention_VSA(DistributedAttention):
         ctx_attn_metadata = forward_context.attn_metadata
 
         batch_size, seq_len, num_heads, head_dim = q.shape
-        # Stack QKV
-        qkvg = torch.cat([q, k, v, gate_compress], dim=0)  # [4*batch, seq_len, num_heads, head_dim]
+        # Stack QKV (a caller with a structurally-zero gate passes None and
+        # skips the gate's share of the all-to-all/tile traffic)
+        stack = [q, k, v] if gate_compress is None else [q, k, v, gate_compress]
+        qkvg = torch.cat(stack, dim=0)  # [3or4*batch, seq_len, num_heads, head_dim]
 
         # Redistribute heads across sequence dimension
-        # Before: [4*batch, shard_seq_len, num_heads, head_dim]
+        # Before: [3or4*batch, shard_seq_len, num_heads, head_dim]
         # After:  [4*batch, full_seq_len, shard_num_heads, head_dim]
         qkvg = sequence_model_parallel_all_to_all_4D(qkvg, scatter_dim=2, gather_dim=1)
 
@@ -203,7 +256,10 @@ class DistributedAttention_VSA(DistributedAttention):
 
         qkvg = self.attn_impl.preprocess_qkv(qkvg, ctx_attn_metadata)
 
-        q, k, v, gate_compress = qkvg.chunk(4, dim=0)
+        if gate_compress is None:
+            q, k, v = qkvg.chunk(3, dim=0)
+        else:
+            q, k, v, gate_compress = qkvg.chunk(4, dim=0)
         output = self.attn_impl.forward(q, k, v, gate_compress, ctx_attn_metadata)  # type: ignore[call-arg]
 
         # Redistribute back if using sequence parallelism
@@ -230,6 +286,7 @@ class LocalAttention(nn.Module):
                  causal: bool = False,
                  supported_attention_backends: tuple[AttentionBackendEnum, ...]
                  | None = None,
+                 default_backend: AttentionBackendEnum | None = None,
                  **extra_impl_args) -> None:
         super().__init__()
         if softmax_scale is None:
@@ -240,7 +297,10 @@ class LocalAttention(nn.Module):
             num_kv_heads = num_heads
 
         dtype = get_compute_dtype()
-        attn_backend = get_attn_backend(head_size, dtype, supported_attention_backends=supported_attention_backends)
+        attn_backend = get_attn_backend(head_size,
+                                        dtype,
+                                        supported_attention_backends=supported_attention_backends,
+                                        default_backend=default_backend)
         impl_cls = attn_backend.get_impl_cls()
         self.attn_impl = impl_cls(num_heads=num_heads,
                                   head_size=head_size,

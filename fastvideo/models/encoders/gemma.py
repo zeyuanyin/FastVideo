@@ -15,13 +15,14 @@ from fastvideo.models.dits.ltx2 import (
     FeedForward,
     LTXRopeType,
     apply_ltx_rotary_emb,
-    generate_ltx_freq_grid_np,
+    generate_ltx_freq_grid_float64,
     generate_ltx_freq_grid_pytorch,
     precompute_ltx_freqs_cis,
 )
 from fastvideo.models.loader.weight_utils import default_weight_loader
 from fastvideo.platforms import AttentionBackendEnum
 from fastvideo.distributed import get_local_torch_device
+import math
 
 
 def _debug_log_line(message: str) -> None:
@@ -58,6 +59,8 @@ class GemmaConnectorConfig:
     rope_type: LTXRopeType
     double_precision_rope: bool
     num_learnable_registers: int | None
+    # LTX-2.3 connector gated attention (default False == LTX-2.0 behavior).
+    apply_gated_attention: bool = False
 
 
 class GemmaFeaturesExtractorProjLinear(nn.Module):
@@ -71,6 +74,26 @@ class GemmaFeaturesExtractorProjLinear(nn.Module):
         return self.aggregate_embed(x)
 
 
+def _norm_and_concat_per_token_rms(
+    encoded_text: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Per-token RMS normalization used by LTX-2.3 feature extraction."""
+    variance = torch.mean(encoded_text**2, dim=2, keepdim=True)
+    normed = encoded_text * torch.rsqrt(variance + 1e-6)
+    normed = normed.reshape(encoded_text.shape[0], encoded_text.shape[1], -1)
+    mask_3d = attention_mask.bool().unsqueeze(-1)
+    return torch.where(mask_3d, normed, torch.zeros_like(normed))
+
+
+def _rescale_norm(
+    x: torch.Tensor,
+    target_dim: int,
+    source_dim: int,
+) -> torch.Tensor:
+    return x * math.sqrt(target_dim / source_dim)
+
+
 class _BasicTransformerBlock1D(nn.Module):
     """1D transformer block for connector processing."""
 
@@ -80,6 +103,7 @@ class _BasicTransformerBlock1D(nn.Module):
         heads: int,
         dim_head: int,
         rope_type: LTXRopeType,
+        apply_gated_attention: bool = False,
         norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -90,6 +114,7 @@ class _BasicTransformerBlock1D(nn.Module):
             dim_head=dim_head,
             norm_eps=norm_eps,
             rope_type=rope_type,
+            apply_gated_attention=apply_gated_attention,
         )
         self.ff = FeedForward(dim, dim_out=dim)
         self.norm_eps = norm_eps
@@ -100,9 +125,7 @@ class _BasicTransformerBlock1D(nn.Module):
         attention_mask: torch.Tensor | None = None,
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        norm_hidden_states = torch.nn.functional.rms_norm(
-            hidden_states, (hidden_states.shape[-1],), eps=self.norm_eps
-        )
+        norm_hidden_states = torch.nn.functional.rms_norm(hidden_states, (hidden_states.shape[-1], ), eps=self.norm_eps)
         if norm_hidden_states.ndim == 4:
             norm_hidden_states = norm_hidden_states.squeeze(1)
 
@@ -115,9 +138,7 @@ class _BasicTransformerBlock1D(nn.Module):
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
-        norm_hidden_states = torch.nn.functional.rms_norm(
-            hidden_states, (hidden_states.shape[-1],), eps=self.norm_eps
-        )
+        norm_hidden_states = torch.nn.functional.rms_norm(hidden_states, (hidden_states.shape[-1], ), eps=self.norm_eps)
         ff_output = self.ff(norm_hidden_states)
         hidden_states = ff_output + hidden_states
         if hidden_states.ndim == 4:
@@ -136,6 +157,7 @@ class _GemmaAttention(nn.Module):
         dim_head: int,
         norm_eps: float,
         rope_type: LTXRopeType,
+        apply_gated_attention: bool = False,
     ) -> None:
         super().__init__()
         inner_dim = dim_head * heads
@@ -150,6 +172,11 @@ class _GemmaAttention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias=True)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=True)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=True)
+        # LTX-2.3 connector gated attention (None default == LTX-2.0).
+        if apply_gated_attention:
+            self.to_gate_logits = nn.Linear(query_dim, heads, bias=True)
+        else:
+            self.to_gate_logits = None
         self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim, bias=True), nn.Identity())
 
     def forward(
@@ -192,7 +219,12 @@ class _GemmaAttention(nn.Module):
             dropout_p=0.0,
             is_causal=False,
         )
-        out = out.transpose(1, 2).reshape(b, q_len, -1)
+        out = out.transpose(1, 2)
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+        out = out.reshape(b, q_len, -1)
         return self.to_out(out)
 
 
@@ -209,17 +241,15 @@ class Embeddings1DConnector(nn.Module):
         self.positional_embedding_max_pos = config.positional_embedding_max_pos
         self.rope_type = config.rope_type
         self.double_precision_rope = config.double_precision_rope
-        self.transformer_1d_blocks = nn.ModuleList(
-            [
-                _BasicTransformerBlock1D(
-                    dim=self.inner_dim,
-                    heads=config.num_attention_heads,
-                    dim_head=config.attention_head_dim,
-                    rope_type=config.rope_type,
-                )
-                for _ in range(config.num_layers)
-            ]
-        )
+        self.transformer_1d_blocks = nn.ModuleList([
+            _BasicTransformerBlock1D(
+                dim=self.inner_dim,
+                heads=config.num_attention_heads,
+                dim_head=config.attention_head_dim,
+                rope_type=config.rope_type,
+                apply_gated_attention=config.apply_gated_attention,
+            ) for _ in range(config.num_layers)
+        ])
         self.num_learnable_registers = config.num_learnable_registers
         if self.num_learnable_registers:
             self.learnable_registers = nn.Parameter(
@@ -227,10 +257,7 @@ class Embeddings1DConnector(nn.Module):
                     self.num_learnable_registers,
                     self.inner_dim,
                     dtype=torch.bfloat16,
-                )
-                * 2.0
-                - 1.0
-            )
+                ) * 2.0 - 1.0)
 
     def _replace_padded_with_learnable_registers(
         self,
@@ -239,31 +266,27 @@ class Embeddings1DConnector(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert hidden_states.shape[1] % self.num_learnable_registers == 0, (
             f"Hidden states sequence length {hidden_states.shape[1]} must be divisible by "
-            f"num_learnable_registers {self.num_learnable_registers}."
-        )
+            f"num_learnable_registers {self.num_learnable_registers}.")
 
-        num_registers_duplications = (
-            hidden_states.shape[1] // self.num_learnable_registers
-        )
-        learnable_registers = torch.tile(
-            self.learnable_registers, (num_registers_duplications, 1)
-        )
-        attention_mask_binary = (
-            attention_mask.squeeze(1).squeeze(1).unsqueeze(-1) >= -9000.0
-        ).int()
+        num_registers_duplications = (hidden_states.shape[1] // self.num_learnable_registers)
+        learnable_registers = torch.tile(self.learnable_registers, (num_registers_duplications, 1))
+        seq_len = hidden_states.shape[1]
+        valid = attention_mask.squeeze(1).squeeze(1) >= -9000.0  # (batch, seq)
 
-        non_zero_hidden_states = hidden_states[
-            :, attention_mask_binary.squeeze().bool(), :
-        ]
-        non_zero_nums = non_zero_hidden_states.shape[1]
-        pad_length = hidden_states.shape[1] - non_zero_nums
-        adjusted_hidden_states = torch.nn.functional.pad(
-            non_zero_hidden_states, pad=(0, 0, 0, pad_length), value=0
-        )
-        flipped_mask = torch.flip(attention_mask_binary, dims=[1])
-        hidden_states = flipped_mask * adjusted_hidden_states + (
-            1 - flipped_mask
-        ) * learnable_registers
+        # Left-align each row's valid tokens, then fill the tail with registers.
+        # A boolean index cannot express this: every row may keep a different
+        # number of tokens, so the result is not rectangular. Gathering a stable
+        # descending argsort of the mask moves the valid tokens to the front of
+        # each row while preserving their original relative order.
+        order = torch.argsort(valid.to(torch.int8), dim=1, descending=True, stable=True)
+        adjusted_hidden_states = torch.gather(hidden_states, 1, order.unsqueeze(-1).expand_as(hidden_states))
+
+        # After the gather, row b holds its valid tokens in slots
+        # [0, valid[b].sum()). Deriving the keep-mask from that per-row count is
+        # what makes this correct when rows have different token counts.
+        keep = (torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
+                < valid.sum(dim=1, keepdim=True)).unsqueeze(-1).to(hidden_states.dtype)
+        hidden_states = keep * adjusted_hidden_states + (1 - keep) * learnable_registers
 
         attention_mask = torch.full_like(
             attention_mask,
@@ -280,11 +303,8 @@ class Embeddings1DConnector(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.num_learnable_registers:
-            hidden_states, attention_mask = (
-                self._replace_padded_with_learnable_registers(
-                    hidden_states, attention_mask
-                )
-            )
+            hidden_states, attention_mask = (self._replace_padded_with_learnable_registers(
+                hidden_states, attention_mask))
 
         indices_grid = torch.arange(
             hidden_states.shape[1],
@@ -292,11 +312,8 @@ class Embeddings1DConnector(nn.Module):
             device=hidden_states.device,
         )
         indices_grid = indices_grid[None, None, :]
-        freq_grid_generator = (
-            generate_ltx_freq_grid_np
-            if self.double_precision_rope
-            else generate_ltx_freq_grid_pytorch
-        )
+        freq_grid_generator = (generate_ltx_freq_grid_float64
+                               if self.double_precision_rope else generate_ltx_freq_grid_pytorch)
         freqs_cis = precompute_ltx_freqs_cis(
             indices_grid=indices_grid,
             dim=self.inner_dim,
@@ -309,13 +326,9 @@ class Embeddings1DConnector(nn.Module):
         )
 
         for block in self.transformer_1d_blocks:
-            hidden_states = block(
-                hidden_states, attention_mask=attention_mask, pe=freqs_cis
-            )
+            hidden_states = block(hidden_states, attention_mask=attention_mask, pe=freqs_cis)
 
-        hidden_states = torch.nn.functional.rms_norm(
-            hidden_states, (hidden_states.shape[-1],), eps=1e-6
-        )
+        hidden_states = torch.nn.functional.rms_norm(hidden_states, (hidden_states.shape[-1], ), eps=1e-6)
 
         return hidden_states, attention_mask
 
@@ -330,12 +343,32 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         super().__init__(config)
         arch = config.arch_config
 
-        self.feature_extractor_linear = GemmaFeaturesExtractorProjLinear(
-            in_features=arch.feature_extractor_in_features,
-            out_features=arch.feature_extractor_out_features,
-        )
+        # LTX-2.3 routes the caption projection before the connector and uses
+        # separate per-modality feature extractor linears. Default (False)
+        # keeps the single LTX-2.0 GemmaFeaturesExtractorProjLinear.
+        self.use_v2_feature_extractor = bool(getattr(arch, "caption_proj_before_connector", False))
+        if self.use_v2_feature_extractor:
+            video_out_features = (getattr(arch, "video_feature_extractor_out_features", None)
+                                  or arch.feature_extractor_out_features)
+            audio_out_features = (getattr(arch, "audio_feature_extractor_out_features", None) or video_out_features)
+            self.video_feature_extractor_linear = nn.Linear(
+                arch.feature_extractor_in_features,
+                video_out_features,
+                bias=True,
+            )
+            self.audio_feature_extractor_linear = nn.Linear(
+                arch.feature_extractor_in_features,
+                audio_out_features,
+                bias=True,
+            )
+        else:
+            self.feature_extractor_linear = GemmaFeaturesExtractorProjLinear(
+                in_features=arch.feature_extractor_in_features,
+                out_features=arch.feature_extractor_out_features,
+            )
 
-        connector_config = GemmaConnectorConfig(
+        connector_apply_gated_attention = bool(getattr(arch, "connector_apply_gated_attention", False))
+        video_connector_config = GemmaConnectorConfig(
             num_attention_heads=arch.connector_num_attention_heads,
             attention_head_dim=arch.connector_attention_head_dim,
             num_layers=arch.connector_num_layers,
@@ -344,9 +377,23 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             rope_type=LTXRopeType(arch.connector_rope_type),
             double_precision_rope=arch.connector_double_precision_rope,
             num_learnable_registers=arch.connector_num_learnable_registers,
+            apply_gated_attention=connector_apply_gated_attention,
         )
-        self.embeddings_connector = Embeddings1DConnector(connector_config)
-        self.audio_embeddings_connector = Embeddings1DConnector(connector_config)
+        audio_connector_config = GemmaConnectorConfig(
+            num_attention_heads=getattr(arch, "audio_connector_num_attention_heads", None)
+            or arch.connector_num_attention_heads,
+            attention_head_dim=getattr(arch, "audio_connector_attention_head_dim", None)
+            or arch.connector_attention_head_dim,
+            num_layers=getattr(arch, "audio_connector_num_layers", None) or arch.connector_num_layers,
+            positional_embedding_theta=arch.connector_positional_embedding_theta,
+            positional_embedding_max_pos=arch.connector_positional_embedding_max_pos,
+            rope_type=LTXRopeType(arch.connector_rope_type),
+            double_precision_rope=arch.connector_double_precision_rope,
+            num_learnable_registers=arch.connector_num_learnable_registers,
+            apply_gated_attention=connector_apply_gated_attention,
+        )
+        self.embeddings_connector = Embeddings1DConnector(video_connector_config)
+        self.audio_embeddings_connector = Embeddings1DConnector(audio_connector_config)
 
         self.gemma_model_path = arch.gemma_model_path
         self.gemma_dtype = arch.gemma_dtype
@@ -354,21 +401,46 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         self._gemma_model: Gemma3ForConditionalGeneration | None = None
 
     def named_parameters(self, prefix: str = "", recurse: bool = True):
-        for name, param in super().named_parameters(
-            prefix=prefix, recurse=recurse
-        ):
+        for name, param in super().named_parameters(prefix=prefix, recurse=recurse):
             if name.startswith("gemma_model."):
                 continue
             yield name, param
+
+    def prepare_for_compile(self) -> None:
+        # Load Gemma outside Dynamo so torch.compile does not trace HF file-system checks.
+        model = self.gemma_model
+        # Run one tiny eager forward before torch.compile. FastVideo calls the text encoder with
+        # Transformers' output_hidden_states path, which wraps each Gemma layer
+        # forward method and restores it by setting an instance-level forward
+        # attribute. If that attribute appears after Dynamo captures guards, the
+        # next text-encoder call recompiles; doing it here makes the first
+        # compiled call see the stable layer state.
+        token_id = getattr(model.config, "eos_token_id", None)
+        if isinstance(token_id, (list, tuple)):
+            token_id = token_id[0] if token_id else None
+        if token_id is None:
+            token_id = getattr(model.config, "pad_token_id", 0)
+        input_ids = torch.full(
+            (1, 1),
+            int(token_id or 0),
+            dtype=torch.long,
+            device=model.device,
+        )
+        attention_mask = torch.ones_like(input_ids)
+        with torch.no_grad():
+            model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
 
     @property
     def gemma_model(self) -> Gemma3ForConditionalGeneration:
         if self._gemma_model is None:
             gemma_path = self.gemma_model_path
             if not gemma_path:
-                raise ValueError(
-                    "gemma_model_path must be set (expected text_encoder/gemma)."
-                )
+                raise ValueError("gemma_model_path must be set (expected text_encoder/gemma).")
             dtype = getattr(torch, self.gemma_dtype, torch.bfloat16)
             self._gemma_model = Gemma3ForConditionalGeneration.from_pretrained(
                 gemma_path,
@@ -384,7 +456,10 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
                     self._gemma_model.config.attn_implementation = "sdpa"
                 if hasattr(self._gemma_model.config, "_attn_implementation"):
                     self._gemma_model.config._attn_implementation = "sdpa"
-            device = next(self.feature_extractor_linear.parameters()).device
+            if self.use_v2_feature_extractor:
+                device = next(self.video_feature_extractor_linear.parameters()).device
+            else:
+                device = next(self.feature_extractor_linear.parameters()).device
             self._gemma_model.to(device=device)
             self._gemma_model.eval()
         return self._gemma_model
@@ -394,57 +469,66 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         hidden_states: tuple[torch.Tensor, ...],
         attention_mask: torch.Tensor,
         padding_side: str,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         encoded_text_features = torch.stack(hidden_states, dim=-1)
         if os.getenv("LTX2_FASTVIDEO_GEMMA_LOG", ""):
             for idx, layer in enumerate(hidden_states):
-                _debug_gemma_log_line(
-                    f"fastvideo:gemma_hidden_state_{idx}"
-                    f":sum={layer.float().sum().item():.6f}"
-                )
-            _debug_gemma_log_line(
-                "fastvideo:gemma_hidden_states_stack"
-                f":sum={encoded_text_features.float().sum().item():.6f}"
-            )
+                _debug_gemma_log_line(f"fastvideo:gemma_hidden_state_{idx}"
+                                      f":sum={layer.float().sum().item():.6f}")
+            _debug_gemma_log_line("fastvideo:gemma_hidden_states_stack"
+                                  f":sum={encoded_text_features.float().sum().item():.6f}")
         encoded_text_features_dtype = encoded_text_features.dtype
-        sequence_lengths = attention_mask.sum(dim=-1)
-        normed_text_features = _norm_and_concat_padded_batch(
-            encoded_text_features, sequence_lengths, padding_side=padding_side
-        )
-        return self.feature_extractor_linear(
-            normed_text_features.to(encoded_text_features_dtype)
-        )
+        if self.use_v2_feature_extractor:
+            # LTX-2.3: per-token RMS norm then separate video/audio linears.
+            normed_text_features = _norm_and_concat_per_token_rms(encoded_text_features,
+                                                                  attention_mask).to(encoded_text_features_dtype)
+            video_out_dim = self.video_feature_extractor_linear.out_features
+            audio_out_dim = self.audio_feature_extractor_linear.out_features
+            video_features = self.video_feature_extractor_linear(
+                _rescale_norm(
+                    normed_text_features,
+                    target_dim=video_out_dim,
+                    source_dim=self.config.arch_config.hidden_size,
+                ))
+            audio_features = self.audio_feature_extractor_linear(
+                _rescale_norm(
+                    normed_text_features,
+                    target_dim=audio_out_dim,
+                    source_dim=self.config.arch_config.hidden_size,
+                ))
+            return video_features, audio_features
 
-    def _convert_to_additive_mask(
-        self, attention_mask: torch.Tensor, dtype: torch.dtype
-    ) -> torch.Tensor:
+        # LTX-2.0: shared min-max norm + single aggregate linear. The two
+        # returned tensors are the same object (video == audio source).
+        sequence_lengths = attention_mask.sum(dim=-1)
+        normed_text_features = _norm_and_concat_padded_batch(encoded_text_features,
+                                                             sequence_lengths,
+                                                             padding_side=padding_side)
+        shared_features = self.feature_extractor_linear(normed_text_features.to(encoded_text_features_dtype))
+        return shared_features, shared_features
+
+    def _convert_to_additive_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return (attention_mask - 1).to(dtype).reshape(
-            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
-        ) * torch.finfo(dtype).max
+            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(dtype).max
 
     def _run_connectors(
         self,
-        encoded_input: torch.Tensor,
+        video_features: torch.Tensor,
+        audio_features: torch.Tensor | None,
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        connector_attention_mask = self._convert_to_additive_mask(
-            attention_mask, encoded_input.dtype
-        )
-        encoded, encoded_connector_attention_mask = self.embeddings_connector(
-            encoded_input, connector_attention_mask
-        )
+        connector_attention_mask = self._convert_to_additive_mask(attention_mask, video_features.dtype)
+        encoded, encoded_connector_attention_mask = self.embeddings_connector(video_features, connector_attention_mask)
 
-        attention_mask = (encoded_connector_attention_mask < 0.000001).to(
-            torch.int64
-        )
-        attention_mask = attention_mask.reshape(
-            [encoded.shape[0], encoded.shape[1], 1]
-        )
+        attention_mask = (encoded_connector_attention_mask < 0.000001).to(torch.int64)
+        attention_mask = attention_mask.reshape([encoded.shape[0], encoded.shape[1], 1])
         encoded = encoded * attention_mask
 
-        encoded_for_audio, _ = self.audio_embeddings_connector(
-            encoded_input, connector_attention_mask
-        )
+        # For LTX-2.0 audio_features is the same tensor as video_features, so
+        # this reproduces the prior behavior (audio connector fed the shared
+        # features). For LTX-2.3 it is fed the separate audio features.
+        audio_features = (audio_features if audio_features is not None else video_features)
+        encoded_for_audio, _ = self.audio_embeddings_connector(audio_features, connector_attention_mask)
 
         return encoded, encoded_for_audio, attention_mask.squeeze(-1)
 
@@ -487,12 +571,12 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             output_hidden_states=True,
             return_dict=True,
         )
-        prompt_embeds = self._run_feature_extractor(
+        video_features, _ = self._run_feature_extractor(
             outputs.hidden_states,
             attention_mask,
             padding_side=target_padding_side,
         )
-        return prompt_embeds, attention_mask
+        return video_features, attention_mask
 
     def run_connectors(
         self,
@@ -500,7 +584,7 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply embedding connectors to precomputed Gemma features."""
-        return self._run_connectors(encoded_input, attention_mask)
+        return self._run_connectors(encoded_input, encoded_input, attention_mask)
 
     def forward(
         self,
@@ -517,43 +601,39 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             attention_mask = torch.ones_like(input_ids)
 
         model = self.gemma_model
-        orig_device = model.device
-        model.to(device=get_local_torch_device())
-        # input_ids = input_ids.to(device=model.device)
-        # attention_mask = attention_mask.to(device=model.device)
+        target_device = get_local_torch_device()
+        # Do not invoke model.to() inside the compiled forward path.
+        # _parse_to returns a non-Tensor torch.device, which Dynamo cannot
+        # trace under fullgraph=True. The model is already moved to device
+        # when first loaded (see gemma_model property + prepare_for_compile),
+        # so this guard is a runtime no-op and Dynamo can DCE it.
+        if model.device != target_device:
+            model.to(device=target_device)
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
         )
-        model.to(device=orig_device)
-        
-        encoded_inputs = self._run_feature_extractor(
+
+        encoded_video, encoded_audio = self._run_feature_extractor(
             outputs.hidden_states,
             attention_mask,
             padding_side=self.padding_side,
         )
         if os.getenv("LTX2_PIPELINE_DEBUG_LOG", "0") == "1":
-            _debug_log_line(
-                "fastvideo:gemma_feature"
-                f":sum={encoded_inputs.float().sum().item():.6f} "
-                f"shape={tuple(encoded_inputs.shape)}"
-            )
-        video_encoding, audio_encoding, attention_mask = self._run_connectors(
-            encoded_inputs, attention_mask
-        )
+            _debug_log_line("fastvideo:gemma_feature"
+                            f":sum={encoded_video.float().sum().item():.6f} "
+                            f"shape={tuple(encoded_video.shape)}")
+        video_encoding, audio_encoding, attention_mask = self._run_connectors(encoded_video, encoded_audio,
+                                                                              attention_mask)
         if os.getenv("LTX2_PIPELINE_DEBUG_LOG", "0") == "1":
-            _debug_log_line(
-                "fastvideo:gemma_video_encoding"
-                f":sum={video_encoding.float().sum().item():.6f} "
-                f"shape={tuple(video_encoding.shape)}"
-            )
-            _debug_log_line(
-                "fastvideo:gemma_audio_encoding"
-                f":sum={audio_encoding.float().sum().item():.6f} "
-                f"shape={tuple(audio_encoding.shape)}"
-            )
+            _debug_log_line("fastvideo:gemma_video_encoding"
+                            f":sum={video_encoding.float().sum().item():.6f} "
+                            f"shape={tuple(video_encoding.shape)}")
+            _debug_log_line("fastvideo:gemma_audio_encoding"
+                            f":sum={audio_encoding.float().sum().item():.6f} "
+                            f"shape={tuple(audio_encoding.shape)}")
 
         hidden_states = (audio_encoding, ) if output_hidden_states else None
         return BaseEncoderOutput(
@@ -562,14 +642,36 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             attention_mask=attention_mask,
         )
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if name == "aggregate_embed.weight":
                 name = "feature_extractor_linear.aggregate_embed.weight"
+            # LTX-2.3 separate video/audio feature extractors. These names
+            # do not appear in LTX-2.0 checkpoints, so they are no-ops there.
+            elif name == "video_aggregate_embed.weight":
+                name = "video_feature_extractor_linear.weight"
+            elif name == "video_aggregate_embed.bias":
+                name = "video_feature_extractor_linear.bias"
+            elif name == "audio_aggregate_embed.weight":
+                name = "audio_feature_extractor_linear.weight"
+            elif name == "audio_aggregate_embed.bias":
+                name = "audio_feature_extractor_linear.bias"
+            elif name == "feature_extractor.video_aggregate_embed.weight":
+                name = "video_feature_extractor_linear.weight"
+            elif name == "feature_extractor.video_aggregate_embed.bias":
+                name = "video_feature_extractor_linear.bias"
+            elif name == "feature_extractor.audio_aggregate_embed.weight":
+                name = "audio_feature_extractor_linear.weight"
+            elif name == "feature_extractor.audio_aggregate_embed.bias":
+                name = "audio_feature_extractor_linear.bias"
+            elif name == "feature_extractor.aggregate_embed.weight":
+                name = "feature_extractor_linear.aggregate_embed.weight"
+            elif name.startswith("video_connector."):
+                name = name.replace("video_connector.", "embeddings_connector.", 1)
+            elif name.startswith("audio_connector."):
+                name = name.replace("audio_connector.", "audio_embeddings_connector.", 1)
             if name not in params_dict:
                 continue
             param = params_dict[name]
@@ -594,9 +696,7 @@ def _norm_and_concat_padded_batch(
         start_indices = t - sequence_lengths[:, None]
         mask = token_indices >= start_indices
     else:
-        raise ValueError(
-            f"padding_side must be 'left' or 'right', got {padding_side}"
-        )
+        raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side}")
 
     mask = mask.reshape(b, t, 1, 1)
     eps = 1e-6
@@ -605,12 +705,8 @@ def _norm_and_concat_padded_batch(
     denom = (sequence_lengths * d).view(b, 1, 1, 1)
     mean = masked.sum(dim=(1, 2), keepdim=True) / (denom + eps)
 
-    x_min = encoded_text.masked_fill(~mask, float("inf")).amin(
-        dim=(1, 2), keepdim=True
-    )
-    x_max = encoded_text.masked_fill(~mask, float("-inf")).amax(
-        dim=(1, 2), keepdim=True
-    )
+    x_min = encoded_text.masked_fill(~mask, float("inf")).amin(dim=(1, 2), keepdim=True)
+    x_max = encoded_text.masked_fill(~mask, float("-inf")).amax(dim=(1, 2), keepdim=True)
     range_ = x_max - x_min
 
     normed = 8 * (encoded_text - mean) / (range_ + eps)
@@ -619,6 +715,7 @@ def _norm_and_concat_padded_batch(
     mask_flattened = mask.reshape(b, t, 1).expand(-1, -1, d * l)
     normed = normed.masked_fill(~mask_flattened, 0.0)
     return normed
+
 
 # Entry point for model registry
 EntryClass = LTX2GemmaTextEncoderModel

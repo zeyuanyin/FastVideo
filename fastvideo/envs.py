@@ -20,23 +20,35 @@ if TYPE_CHECKING:
     FASTVIDEO_LOGGING_CONFIG_PATH: str | None = None
     FASTVIDEO_TRACE_FUNCTION: int = 0
     FASTVIDEO_ATTENTION_BACKEND: str | None = None
+    FASTVIDEO_FA4: bool = False
+    FASTVIDEO_MINIMAX_H3_FA4_PACKED_VARLEN: bool = False
+    FASTVIDEO_INFERENCE_TORCH_COMPILE: bool = False
+    FASTVIDEO_MINIMAX_H3_FUSIONS: str = ""
+    FASTVIDEO_VAE_PARALLEL_DECODE: bool = False
+    FASTVIDEO_VAE_PARALLEL_ENCODE: bool = False
+    FASTVIDEO_VAE_PARALLEL_DECODE_STRATEGY: str | None = None
+    FASTVIDEO_ULYSSES_A2A: str = "off"
     FASTVIDEO_WORKER_MULTIPROC_METHOD: str = "spawn"
     FASTVIDEO_TARGET_DEVICE: str = "cuda"
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
+    FASTVIDEO_NVTX_PROFILE: bool = False
     FASTVIDEO_TORCH_PROFILER_DIR: str | None = None
     FASTVIDEO_TORCH_PROFILER_RECORD_SHAPES: bool = False
     FASTVIDEO_TORCH_PROFILER_WITH_PROFILE_MEMORY: bool = False
-    FASTVIDEO_TORCH_PROFILER_WITH_STACK: bool = True
+    FASTVIDEO_TORCH_PROFILER_WITH_STACK: bool = False
     FASTVIDEO_TORCH_PROFILER_WITH_FLOPS: bool = False
-    FASTVIDEO_TORCH_PROFILER_WAIT_STEPS: int = 2
-    FASTVIDEO_TORCH_PROFILER_WARMUP_STEPS: int = 1
-    FASTVIDEO_TORCH_PROFILER_ACTIVE_STEPS: int = 2
     FASTVIDEO_TORCH_PROFILE_REGIONS: str = ""
+    FASTVIDEO_TRACE_ACTIVATIONS: bool = False
+    FASTVIDEO_TRACE_LAYERS: str = ""
+    FASTVIDEO_TRACE_STATS: str = "abs_mean,sum"
+    FASTVIDEO_TRACE_OUTPUT: str = "/tmp/fv_trace_<pid>.jsonl"
+    FASTVIDEO_TRACE_STEPS: str = ""
     FASTVIDEO_SERVER_DEV_MODE: bool = False
     FASTVIDEO_STAGE_LOGGING: bool = False
+    FASTVIDEO_CFG_GATE_STEP: float = 1.0
     FASTVIDEO_HOST_IP: str = ""
     FASTVIDEO_LOOPBACK_IP: str = ""
 
@@ -201,12 +213,70 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "VIDEO_SPARSE_ATTN": use Video Sparse Attention
     # - "SAGE_ATTN": use Sage Attention
     # - "SAGE_ATTN_THREE": use Sage Attention 3
+    # FLASH_ATTN uses FlashAttention-3/2; to run FlashAttention-4 set
+    # FASTVIDEO_FA4=1 as well (see below).
     "FASTVIDEO_ATTENTION_BACKEND":
     lambda: os.getenv("FASTVIDEO_ATTENTION_BACKEND", None),
+
+    # If set (=1), the FLASH_ATTN backend uses FlashAttention-4
+    # (flash_attn.cute). FA4 is opt-in and never auto-selected just because it
+    # is installed. Below sm90, grad-enabled and GQA calls are routed to FA2
+    # (FA4's backward asserts sm90+ and its pack_gqa fails to JIT there).
+    "FASTVIDEO_FA4":
+    lambda: os.getenv("FASTVIDEO_FA4", "0") != "0",
+
+    # Use FA4's packed-varlen entry point for the long, single-document
+    # MiniMax-H3 dense DiT self-attention path. This changes floating-point
+    # reduction order relative to the fixed-length entry point, so it remains
+    # an explicit inference-only speed/quality opt-in.
+    "FASTVIDEO_MINIMAX_H3_FA4_PACKED_VARLEN":
+    lambda: os.getenv("FASTVIDEO_MINIMAX_H3_FA4_PACKED_VARLEN", "0") != "0",
+
+    # If set (=1), enable regional (per-transformer-block) fullgraph
+    # torch.compile for the DiT at inference — the inference-side counterpart
+    # of the training regional-compile port of hao-ai-lab/FastVideo#1718.
+    # Equivalent to FastVideoArgs.inference_torch_compile=True (e.g. via
+    # PipelineSelection.experimental={"inference_torch_compile": True}). VSA
+    # and other non-fullgraph-traceable attention backends degrade to eager
+    # with one warning; see _regional_compile_unsupported_reason in
+    # fastvideo/models/loader/fsdp_load.py.
+    "FASTVIDEO_INFERENCE_TORCH_COMPILE":
+    lambda: os.getenv("FASTVIDEO_INFERENCE_TORCH_COMPILE", "0") != "0",
+
+    # If set (=1), MiniMax-H3 VAE decode (and, with the ENCODE variant,
+    # reference-video encode) round-robins its temporal chunks across the
+    # sequence-parallel ranks instead of running serially on the output rank.
+    # Folded into FastVideoArgs.vae_parallel_decode / vae_parallel_encode at
+    # construction (parse-once). The STRATEGY variant picks the chunk
+    # transport collective: "gather" (default) or "all_gather".
+    "FASTVIDEO_VAE_PARALLEL_DECODE":
+    lambda: os.getenv("FASTVIDEO_VAE_PARALLEL_DECODE", "0") != "0",
+    "FASTVIDEO_VAE_PARALLEL_ENCODE":
+    lambda: os.getenv("FASTVIDEO_VAE_PARALLEL_ENCODE", "0") != "0",
+    "FASTVIDEO_VAE_PARALLEL_DECODE_STRATEGY":
+    lambda: os.getenv("FASTVIDEO_VAE_PARALLEL_DECODE_STRATEGY", None),
+
+    # Opt-in MiniMax-H3 inference-only Triton fusions adapted from the
+    # NVlabs/Sana Sol-Engine implementation. Accepts `all`, `1`, or a
+    # comma-separated subset of `modulate,qknorm_rope,swiglu`. An empty value
+    # (the default), `0`, or `none` keeps the eager implementation.
+    "FASTVIDEO_MINIMAX_H3_FUSIONS":
+    lambda: os.getenv("FASTVIDEO_MINIMAX_H3_FUSIONS", ""),
+
+    # Sequence-parallel all-to-all backend.
+    # - "off" (default): the NCCL path in DistributedAutograd.AllToAll4D
+    # - "auto": fused NVLink kernel when the group is a load-store accessible
+    #   mesh of 2/4/6/8 ranks in eager execution, else the NCCL path.
+    "FASTVIDEO_ULYSSES_A2A":
+    lambda: os.getenv("FASTVIDEO_ULYSSES_A2A", "off").strip().lower(),
 
     # Use dedicated multiprocess context for workers.
     "FASTVIDEO_WORKER_MULTIPROC_METHOD":
     lambda: os.getenv("FASTVIDEO_WORKER_MULTIPROC_METHOD", "spawn"),
+
+    # Emit lightweight NVTX ranges for external profilers such as Nsight Systems.
+    "FASTVIDEO_NVTX_PROFILE":
+    lambda: os.getenv("FASTVIDEO_NVTX_PROFILE", "0") != "0",
 
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
@@ -226,11 +296,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FASTVIDEO_TORCH_PROFILER_WITH_PROFILE_MEMORY":
     lambda: bool(os.getenv("FASTVIDEO_TORCH_PROFILER_WITH_PROFILE_MEMORY", "0") != "0"),
 
-    # Enable torch profiler to profile stack if set
-    # FASTVIDEO_TORCH_PROFILER_WITH_STACK=1. If not set, torch profiler WILL
-    # profile stack by default.
+    # Enable torch profiler stack capture with
+    # FASTVIDEO_TORCH_PROFILER_WITH_STACK=1. Off by default: stack capture
+    # costs ~1.5x runtime overhead and ~1.4x trace size.
     "FASTVIDEO_TORCH_PROFILER_WITH_STACK":
-    lambda: bool(os.getenv("FASTVIDEO_TORCH_PROFILER_WITH_STACK", "1") != "0"),
+    lambda: bool(os.getenv("FASTVIDEO_TORCH_PROFILER_WITH_STACK", "0") != "0"),
 
     # Enable torch profiler to profile flops if set
     # FASTVIDEO_TORCH_PROFILER_WITH_FLOPS=1. If not set, torch profiler will
@@ -239,18 +309,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(os.getenv("FASTVIDEO_TORCH_PROFILER_WITH_FLOPS", "0") != "0"),
     # Wait steps per profiling cycle (torch.profiler.schedule wait parameter)
     # Defaults to 2 if not set.
-    "FASTVIDEO_TORCH_PROFILER_WAIT_STEPS":
-    lambda: int(os.getenv("FASTVIDEO_TORCH_PROFILER_WAIT_STEPS", "2")),
     # Warmup steps per profiling cycle (torch.profiler.schedule warmup parameter)
     # Defaults to 1 if not set.
-    "FASTVIDEO_TORCH_PROFILER_WARMUP_STEPS":
-    lambda: int(os.getenv("FASTVIDEO_TORCH_PROFILER_WARMUP_STEPS", "1")),
     # Active steps per profiling cycle (torch.profiler.schedule active parameter)
     # Defaults to 2 if not set.
-    "FASTVIDEO_TORCH_PROFILER_ACTIVE_STEPS":
-    lambda: int(os.getenv("FASTVIDEO_TORCH_PROFILER_ACTIVE_STEPS", "2")),
     "FASTVIDEO_TORCH_PROFILE_REGIONS":
     lambda: os.getenv("FASTVIDEO_TORCH_PROFILE_REGIONS", ""),
+
+    # Enable activation trace hooks if set.
+    "FASTVIDEO_TRACE_ACTIVATIONS":
+    lambda: bool(os.getenv("FASTVIDEO_TRACE_ACTIVATIONS", "0") != "0"),
+    # Regex filter for traced module names. Empty means all modules.
+    "FASTVIDEO_TRACE_LAYERS":
+    lambda: os.getenv("FASTVIDEO_TRACE_LAYERS", ""),
+    # Comma-separated activation stats to dump for each output tensor.
+    "FASTVIDEO_TRACE_STATS":
+    lambda: os.getenv("FASTVIDEO_TRACE_STATS", "abs_mean,sum"),
+    # JSONL sink path. The literal <pid> is replaced at runtime.
+    "FASTVIDEO_TRACE_OUTPUT":
+    lambda: os.getenv("FASTVIDEO_TRACE_OUTPUT", "/tmp/fv_trace_<pid>.jsonl"),
+    # Comma-separated denoise step indices. Empty means all steps.
+    "FASTVIDEO_TRACE_STEPS":
+    lambda: os.getenv("FASTVIDEO_TRACE_STEPS", ""),
 
     # If set, fastvideo will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
@@ -262,6 +342,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # taken for each stage
     "FASTVIDEO_STAGE_LOGGING":
     lambda: bool(int(os.getenv("FASTVIDEO_STAGE_LOGGING", "0"))),
+
+    # CFG gating fraction for stale-uncond reuse (Adaptive Guidance / LinearAG
+    # variant — Castillo et al. 2023, arXiv:2312.12487).  Float in [0, 1].
+    # Interpretation: for step index `i < len(timesteps) * X`, run both
+    # cond and uncond forwards and refresh delta_cached = cond - uncond.
+    # Once `i >= len(timesteps) * X`, skip the uncond forward and reuse
+    # the cached delta:  noise_pred = cond + (guidance_scale - 1) * delta.
+    #
+    # Edge cases:
+    #   1.0 (default) : disables gating; identical to baseline two-pass CFG.
+    #   0.5           : run uncond for the first half of steps, reuse delta
+    #                    for the second half (~25% inference time saved on
+    #                    bandwidth-bound SP setups).
+    #   0.0           : step 0 still computes uncond fresh (cache is empty
+    #                    at start) — all subsequent steps reuse the step-0
+    #                    delta.  This is the most aggressive setting; does
+    #                    NOT mean "no uncond forward ever."
+    #
+    # Caveats:
+    #   - Algorithmically approximate; not bit-exact vs baseline CFG.
+    #     Validate per-pipeline with SSIM / VBench before lowering below 1.0.
+    #   - Interaction with `guidance_rescale > 0` is unvalidated; the
+    #     denoising stage logs a warning when both are active.
+    #   - Wan2.2 high/low-noise expert switch invalidates the cache.
+    "FASTVIDEO_CFG_GATE_STEP":
+    lambda: float(os.getenv("FASTVIDEO_CFG_GATE_STEP", "1.0")),
 }
 
 # end-env-vars-definition

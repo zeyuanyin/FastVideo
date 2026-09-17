@@ -28,6 +28,7 @@ class DecodingStage(PipelineStage):
     This stage handles the decoding of latent representations into the final
     output format (e.g., pixel values).
     """
+    performance_component_metric = "vae_decode_time_s"
 
     def __init__(self, vae, pipeline=None) -> None:
         self.vae: ParallelTiledVAE = vae
@@ -47,7 +48,28 @@ class DecodingStage(PipelineStage):
         result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
         return result
 
-    def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+    def _is_flux2_packed(self, latents: torch.Tensor) -> bool:
+        """Detect Flux2 packed latents by checking channel count against VAE geometry.
+
+        Flux2 packs latent_channels into 2x2 spatial patches, so the DiT
+        operates on ``latent_channels * 4`` channels at half spatial resolution.
+        The VAE's ``post_quant_conv`` input dimension equals ``latent_channels``.
+        """
+        if not hasattr(self.vae, "bn"):
+            return False
+        pqc = getattr(self.vae, "post_quant_conv", None)
+        if pqc is None:
+            return False
+        vae_latent_ch = pqc.weight.shape[1]
+        packed_ch = vae_latent_ch * 4  # 2x2 patch packing
+        ch_dim = 1 if latents.ndim >= 4 else -1
+        return latents.shape[ch_dim] == packed_ch
+
+    def _denormalize_latents(
+        self,
+        latents: torch.Tensor,
+        fastvideo_args: FastVideoArgs,
+    ) -> torch.Tensor:
         """Convert normalized latents into the VAE's expected latent space."""
         # Some VAEs handle latent (de)normalization internally.
         if bool(getattr(self.vae, "handles_latent_denorm", False)):
@@ -55,27 +77,70 @@ class DecodingStage(PipelineStage):
 
         cfg = getattr(self.vae, "config", None)
 
-        # MatrixGame-style: z = z * std + mean
-        if (cfg is not None and hasattr(cfg, "latents_mean") and hasattr(cfg, "latents_std")):
-            latents_mean = torch.tensor(cfg.latents_mean, device=latents.device,
+        # Matrix-Game 2.0-style: z = z * std + mean. Some configs declare these
+        # fields as None, so test the values rather than mere attribute presence
+        # -- otherwise torch.tensor(None) raises instead of falling through.
+        latents_mean_value = getattr(cfg, "latents_mean", None) if cfg is not None else None
+        latents_std_value = getattr(cfg, "latents_std", None) if cfg is not None else None
+        if latents_mean_value is not None and latents_std_value is not None:
+            # Preserve the released LingBot reciprocal arithmetic and its float32 rounding for numeric alignment
+            if type(fastvideo_args.pipeline_config).__name__.startswith("LingBotVideo"):
+                latents_mean = torch.tensor(latents_mean_value, device=latents.device,
+                                            dtype=torch.float32).view(1, -1, 1, 1, 1)
+                latents_std_inv = 1.0 / torch.tensor(latents_std_value, device=latents.device,
+                                                     dtype=torch.float32).view(1, -1, 1, 1, 1)
+                # See Lingbot: https://github.com/Robbyant/lingbot-video/blob/a638721cf2271804d02738b69f2ad788c4a559fc/lingbot_video/pipeline_lingbot_video.py#L282
+                return latents.float() / latents_std_inv + latents_mean
+
+            latents_mean = torch.tensor(latents_mean_value, device=latents.device,
                                         dtype=latents.dtype).view(1, -1, 1, 1, 1)
-            latents_std = torch.tensor(cfg.latents_std, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1, 1)
+            latents_std = torch.tensor(latents_std_value, device=latents.device,
+                                       dtype=latents.dtype).view(1, -1, 1, 1, 1)
             return latents * latents_std + latents_mean
 
-        # Diffusers-style: scaling_factor (+ optional shift_factor)
-        if hasattr(self.vae, "scaling_factor"):
-            if isinstance(self.vae.scaling_factor, torch.Tensor):
-                latents = latents / self.vae.scaling_factor.to(latents.device, latents.dtype)
+        # Diffusers-style: scaling_factor (+ optional shift_factor), read from
+        # the module only. Nearly every VAE *config* also carries a
+        # scaling_factor whose decode() already accounts for it, so sourcing it
+        # from cfg here would newly divide latents for VAEs that have always
+        # passed through untouched (flux2, hunyuanvideo, hunyuanvideo15, ltx2).
+        scaling_factor = getattr(self.vae, "scaling_factor", None)
+        if scaling_factor is not None:
+            if isinstance(scaling_factor, torch.Tensor):
+                latents = latents / scaling_factor.to(latents.device, latents.dtype)
             else:
-                latents = latents / self.vae.scaling_factor
+                latents = latents / scaling_factor
 
-            if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
-                if isinstance(self.vae.shift_factor, torch.Tensor):
-                    latents = latents + self.vae.shift_factor.to(latents.device, latents.dtype)
+            shift_factor = getattr(self.vae, "shift_factor", None)
+            if shift_factor is not None:
+                if isinstance(shift_factor, torch.Tensor):
+                    latents = latents + shift_factor.to(latents.device, latents.dtype)
                 else:
-                    latents = latents + self.vae.shift_factor
+                    latents = latents + shift_factor
 
         return latents
+
+    @staticmethod
+    def _unpatchify_latents(latents: torch.Tensor) -> torch.Tensor:
+        """Inverse of 2x2 patch packing: ``(B, C*4, H', W') -> (B, C, 2*H', 2*W')``."""
+        batch_size, num_channels, height, width = latents.shape
+        latents = latents.reshape(batch_size, num_channels // (2 * 2), 2, 2, height, width)
+        latents = latents.permute(0, 1, 4, 2, 5, 3)
+        latents = latents.reshape(batch_size, num_channels // (2 * 2), height * 2, width * 2)
+        return latents
+
+    def _flux2_bn_denorm_and_unpatchify(self, latents: torch.Tensor) -> torch.Tensor:
+        """BN denormalize then unpatchify packed latents for VAE decode.
+
+        Handles any channel count (e.g. 64->16, 128->32) via 2x2 spatial unpack.
+        """
+        running_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        running_var = self.vae.bn.running_var.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        cfg = getattr(self.vae, "config", None)
+        arch = getattr(cfg, "arch_config", None) if cfg else None
+        eps = getattr(arch, "batch_norm_eps", None) or getattr(cfg, "batch_norm_eps", 1e-5)
+        bn_std = torch.sqrt(torch.clamp(running_var + eps, min=1e-6))
+        latents = latents * bn_std + running_mean
+        return self._unpatchify_latents(latents)
 
     @torch.no_grad()
     def decode(self, latents: torch.Tensor, fastvideo_args: FastVideoArgs) -> torch.Tensor:
@@ -96,11 +161,20 @@ class DecodingStage(PipelineStage):
         self.vae = self.vae.to(get_local_torch_device())
         latents = latents.to(get_local_torch_device())
 
-        # Setup VAE precision
-        vae_dtype = PRECISION_TO_TYPE[fastvideo_args.pipeline_config.vae_precision]
+        # Setup VAE precision (decode-only override falls back to vae_precision)
+        decode_precision = (fastvideo_args.pipeline_config.vae_decode_precision
+                            or fastvideo_args.pipeline_config.vae_precision)
+        vae_dtype = PRECISION_TO_TYPE[decode_precision]
         vae_autocast_enabled = (vae_dtype != torch.float32) and not fastvideo_args.disable_autocast
 
-        latents = self._denormalize_latents(latents)
+        # Flux2: skip denormalize on packed latents; BN denorm runs below instead
+        if not (latents.ndim == 5 and self._is_flux2_packed(latents)):
+            latents = self._denormalize_latents(latents, fastvideo_args)
+
+        # The released LingBot decoder enters Wan VAE in channels-last-3d
+        # layout; matching that boundary avoids selecting a different Conv3d path.
+        if (type(fastvideo_args.pipeline_config).__name__.startswith("LingBotVideo") and latents.ndim == 5):
+            latents = latents.contiguous(memory_format=torch.channels_last_3d)
 
         # Decode latents
         with torch.autocast(device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled):
@@ -110,7 +184,27 @@ class DecodingStage(PipelineStage):
             #     self.vae.enable_parallel()
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
+            # Flux2's image VAE expects 4D (B, C, H, W); squeeze the singleton T
+            # only for Flux2 packed latents. Gated on `_is_flux2_packed` so video
+            # VAEs that legitimately decode 5D latents with T=1 are untouched.
+            squeezed_for_vae = False
+            if latents.ndim == 5 and latents.shape[2] == 1 and self._is_flux2_packed(latents):
+                latents = latents.squeeze(2)
+                squeezed_for_vae = True
+            # Flux2 packed: BN denorm + unpatchify for VAE decode.
+            # BN denorm is the complete inverse normalisation for Flux2 (no
+            # scaling_factor/shift_factor step), matching Diffusers.
+            if latents.ndim == 4 and self._is_flux2_packed(latents):
+                latents = self._flux2_bn_denorm_and_unpatchify(latents)
             image = self.vae.decode(latents)
+            # Unwrap diffusers-style DecoderOutput / tuple (Flux2 VAE returns a
+            # DecoderOutput). No-op for existing VAEs that return a plain tensor.
+            if hasattr(image, "sample"):
+                image = image.sample
+            elif isinstance(image, tuple | list):
+                image = image[0]
+            if squeezed_for_vae:
+                image = image.unsqueeze(2)
 
         # Normalize image to [0, 1] range
         image = (image / 2 + 0.5).clamp(0, 1)
@@ -139,11 +233,13 @@ class DecodingStage(PipelineStage):
         self.vae = self.vae.to(get_local_torch_device())
         latents = latents.to(get_local_torch_device())
 
-        # Setup VAE precision
-        vae_dtype = PRECISION_TO_TYPE[fastvideo_args.pipeline_config.vae_precision]
+        # Setup VAE precision (decode-only override falls back to vae_precision)
+        decode_precision = (fastvideo_args.pipeline_config.vae_decode_precision
+                            or fastvideo_args.pipeline_config.vae_precision)
+        vae_dtype = PRECISION_TO_TYPE[decode_precision]
         vae_autocast_enabled = (vae_dtype != torch.float32) and not fastvideo_args.disable_autocast
 
-        latents = self._denormalize_latents(latents)
+        latents = self._denormalize_latents(latents, fastvideo_args)
 
         # Initialize cache if needed
         if cache is None:
@@ -201,7 +297,13 @@ class DecodingStage(PipelineStage):
                 pipeline.add_module("vae", self.vae)
             fastvideo_args.model_loaded["vae"] = True
 
-        frames = batch.latents if fastvideo_args.output_type == "latent" else self.decode(batch.latents, fastvideo_args)
+        if fastvideo_args.output_type == "latent":
+            frames = batch.latents
+            if frames.ndim == 5 and frames.shape[2] == 1 and self._is_flux2_packed(frames):
+                frames = self._flux2_bn_denorm_and_unpatchify(frames.squeeze(2))
+                frames = frames.unsqueeze(2)
+        else:
+            frames = self.decode(batch.latents, fastvideo_args)
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:

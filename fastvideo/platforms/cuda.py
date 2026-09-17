@@ -4,6 +4,7 @@
 pynvml. However, it should not initialize cuda context.
 """
 
+import ctypes
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
@@ -23,6 +24,56 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 pynvml = import_pynvml()  # type: ignore[no-untyped-call]
+
+_CUDA_SUCCESS = 0
+# Stable value from CUDA's public CUdevice_attribute enum.
+_CU_DEVICE_ATTRIBUTE_INTEGRATED = 18
+_CUDA_DRIVER_LIBRARY = "nvcuda.dll" if os.name == "nt" else "libcuda.so.1"
+
+
+def _cuda_driver_device_is_integrated(device_id: int) -> bool:
+    """Query ``CU_DEVICE_ATTRIBUTE_INTEGRATED`` without creating a context.
+
+    ``cuInit`` loads the CUDA driver, while these device-management calls only
+    inspect the logical device ordinal. They neither create nor retain a CUDA
+    context. Driver initialization is not pre-fork safe, so this probe must
+    remain worker-local after process creation and device binding. Using the
+    driver ordinal preserves CUDA_VISIBLE_DEVICES ordering, including UUID and
+    MIG selectors.
+    """
+    try:
+        driver = ctypes.CDLL(_CUDA_DRIVER_LIBRARY)
+        driver.cuInit.argtypes = [ctypes.c_uint]
+        driver.cuInit.restype = ctypes.c_int
+        driver.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        driver.cuDeviceGet.restype = ctypes.c_int
+        driver.cuDeviceGetAttribute.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        driver.cuDeviceGetAttribute.restype = ctypes.c_int
+
+        if driver.cuInit(0) != _CUDA_SUCCESS:
+            return False
+
+        device = ctypes.c_int()
+        if driver.cuDeviceGet(ctypes.byref(device), device_id) != _CUDA_SUCCESS:
+            return False
+
+        is_integrated = ctypes.c_int()
+        if driver.cuDeviceGetAttribute(
+                ctypes.byref(is_integrated),
+                _CU_DEVICE_ATTRIBUTE_INTEGRATED,
+                device,
+        ) != _CUDA_SUCCESS:
+            return False
+        return bool(is_integrated.value)
+    except Exception:
+        # Missing/incompatible driver libraries and unavailable devices must
+        # preserve the established discrete-memory offload policy.
+        return False
+
 
 # pytorch 2.5 uses cudnn sdpa by default, which will cause crash on some models
 # see https://github.com/huggingface/diffusers/issues/9704 for details
@@ -78,6 +129,12 @@ class CudaPlatformBase(Platform):
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         raise NotImplementedError
+
+    @classmethod
+    def has_unified_memory(cls, device_id: int = 0) -> bool:
+        # This is cudaDeviceProp::integrated's driver-level source of truth. It
+        # is true on parts such as GB10 and Jetson whose GPU reads host memory.
+        return _cuda_driver_device_is_integrated(device_id)
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -140,6 +197,36 @@ class CudaPlatformBase(Platform):
             except ImportError as e:
                 logger.info(e)
                 logger.info("Sage Attention 3 backend is not installed. Fall back to Flash Attention.")
+        elif selected_backend == AttentionBackendEnum.ATTN_QAT_INFER:
+            from fastvideo.attention.backends.attn_qat_infer import (  # noqa: F401
+                AttnQatInferBackend, attn_qat_infer_receipt, is_attn_qat_infer_available)
+            if is_attn_qat_infer_available():
+                logger.info("Using Attn-QAT inference backend (%s).", attn_qat_infer_receipt())
+                return "fastvideo.attention.backends.attn_qat_infer.AttnQatInferBackend"
+            raise ImportError(
+                f"ATTN_QAT_INFER selected but the inference kernel is not usable ({attn_qat_infer_receipt()}). "
+                "Silent fallback would run plain FlashAttention while the caller believes it is measuring "
+                "FP4-QAT attention — an A/B comparison would silently benchmark bf16 against bf16; "
+                "refusing to proceed. Build the fastvideo-kernel attn_qat_infer target for this arch "
+                "or pick a different FASTVIDEO_ATTENTION_BACKEND.")
+        elif selected_backend == AttentionBackendEnum.ATTN_QAT_TRAIN:
+            from fastvideo.attention.backends.attn_qat_train import (  # noqa: F401
+                AttnQatTrainBackend, is_attn_qat_train_available)
+            if is_attn_qat_train_available():
+                logger.info("Using Attn-QAT training (fake-quantized attention) backend.")
+                return "fastvideo.attention.backends.attn_qat_train.AttnQatTrainBackend"
+            raise ImportError(
+                "ATTN_QAT_TRAIN selected but fastvideo_kernel.triton_kernels.attn_qat_train is not built. "
+                "Silent fallback would produce a non-QAT training run; refusing to proceed. "
+                "Install the training kernel or pick a different FASTVIDEO_ATTENTION_BACKEND.")
+        elif selected_backend == AttentionBackendEnum.NABLA_ATTN:
+            from fastvideo.attention.backends.nabla import CAN_USE_FLEX_ATTN
+            if CAN_USE_FLEX_ATTN:
+                logger.info("Using NABLA block-sparse flex-attention backend.")
+                return "fastvideo.attention.backends.nabla.NablaAttentionBackend"
+            raise ImportError("NABLA_ATTN selected but torch.nn.attention.flex_attention is unavailable in this "
+                              "PyTorch build. Silent fallback to dense attention would be orders of magnitude "
+                              "slower and diverge from the reference; upgrade PyTorch or pick a different backend.")
         elif selected_backend == AttentionBackendEnum.VIDEO_SPARSE_ATTN:
             try:
                 from fastvideo_kernel import video_sparse_attn  # noqa: F401
@@ -154,7 +241,29 @@ class CudaPlatformBase(Platform):
                 raise ImportError("The Video Sparse Attention backend is not installed. "
                                   "To install it, please follow the instructions at: "
                                   "https://hao-ai-lab.github.io/FastVideo/video_sparse_attention/installation ") from e
+        elif selected_backend == AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+            try:
+                from fastvideo_kernel.block_sparse_attn_256 import (  # noqa: F401
+                    block_sparse_attn_256_bshd)
 
+                logger.info("Using MiniMax-H3 Video Sparse Attention backend.")
+
+                return "fastvideo.attention.backends.video_sparse_attn_h3.MiniMaxH3VSABackend"
+            except ImportError as e:
+                logger.error("Failed to import H3 Video Sparse Attention backend: %s", str(e))
+                raise ImportError("VIDEO_SPARSE_ATTN_H3 selected but fastvideo_kernel's block-sparse "
+                                  "kernels are unavailable. Install fastvideo-kernel or pick a different "
+                                  "FASTVIDEO_ATTENTION_BACKEND.") from e
+        elif selected_backend == AttentionBackendEnum.BSA_ATTN:
+            try:
+                from fastvideo.attention.backends.bsa_attn import (  # noqa: F401
+                    BSAAttentionBackend)
+                logger.info("Using BSA Attention backend.")
+
+                return "fastvideo.attention.backends.bsa_attn.BSAAttentionBackend"
+            except ImportError as e:
+                logger.error("Failed to import BSA Attention backend: %s", str(e))
+                raise ImportError("The BSA Attention backend failed to import.") from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:
                 from fastvideo_kernel import moba_attn_varlen  # noqa: F401
@@ -186,7 +295,7 @@ class CudaPlatformBase(Platform):
             except ImportError as e:
                 logger.error("Failed to import SageSLA Attention backend: %s", str(e))
                 raise ImportError("SageSLA Attention backend requires spas_sage_attn. "
-                                  "Install with: pip install git+https://github.com/thu-ml/SpargeAttn.git") from e
+                                  "Install with: uv pip install git+https://github.com/thu-ml/SpargeAttn.git") from e
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
             return "fastvideo.attention.backends.sdpa.SDPABackend"

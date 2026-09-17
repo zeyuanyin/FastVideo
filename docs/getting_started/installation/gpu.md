@@ -6,7 +6,7 @@ Instructions to install FastVideo for NVIDIA CUDA GPUs.
 
 - **OS: Linux or Windows WSL**
 - **Python: 3.10-3.12**
-- **CUDA 12.8**
+- **CUDA: 12.6 or 13.0**
 - **At least 1 NVIDIA GPU**
 
 ## Set up using Python
@@ -47,7 +47,7 @@ conda activate fastvideo
 #### With uv (recommended)
 
 ```bash
-uv pip install fastvideo
+UV_TORCH_BACKEND=cu126 uv pip install fastvideo
 ```
 
 Also optionally install FlashAttention:
@@ -58,14 +58,16 @@ uv pip install flash-attn --no-build-isolation -v
 
 #### With Conda environment (alternative)
 
+`uv` works inside an active conda env too, so prefer `uv pip` for the actual install:
+
 ```bash
-pip install fastvideo
+UV_TORCH_BACKEND=cu126 uv pip install fastvideo
 ```
 
 Also optionally install FlashAttention:
 
 ```bash
-pip install flash-attn --no-build-isolation -v
+uv pip install flash-attn --no-build-isolation -v
 ```
 
 ### Installation from Source
@@ -78,16 +80,19 @@ git clone https://github.com/hao-ai-lab/FastVideo.git && cd FastVideo
 
 #### 2. Install FastVideo
 
+FastVideo requires PyTorch 2.12.0. Use `UV_TORCH_BACKEND=cu126` for CUDA 12 or
+`UV_TORCH_BACKEND=cu130` for CUDA 13.
+
 Basic installation:
 
 ```bash
-uv pip install -e .
+UV_TORCH_BACKEND=cu126 uv pip install -e .
 ```
 
 Alternative with Conda environment:
 
 ```bash
-pip install -e .
+UV_TORCH_BACKEND=cu126 uv pip install -e .
 ```
 
 ### Optional Dependencies
@@ -101,7 +106,7 @@ uv pip install flash-attn --no-build-isolation -v
 Alternative with Conda environment:
 
 ```bash
-pip install flash-attn --no-build-isolation -v
+uv pip install flash-attn --no-build-isolation -v
 ```
 
 ## Set up using Docker
@@ -116,7 +121,7 @@ If you're planning to contribute to FastVideo please see the following page:
 ## Hardware Requirements
 
 ### For Basic Inference
-- NVIDIA GPU with CUDA 12.8 support
+- NVIDIA GPU compatible with CUDA 12.6 or newer
 
 ### For Lora Finetuning
 - 40GB GPU memory each for 2 GPUs with lora
@@ -129,4 +134,4 @@ If you're planning to contribute to FastVideo please see the following page:
 
 If you encounter any issues during installation, please open an issue on our [GitHub repository](https://github.com/hao-ai-lab/FastVideo).
 
-You can also join our [Slack community](https://join.slack.com/t/fastvideo/shared_invite/zt-38u6p1jqe-yDI1QJOCEnbtkLoaI5bjZQ) for additional support.
+You can also join our [Slack community](https://join.slack.com/t/fastvideo/shared_invite/zt-3f4lao1uq-u~Ipx6Lt4J27AlD2y~IdLQ) for additional support.

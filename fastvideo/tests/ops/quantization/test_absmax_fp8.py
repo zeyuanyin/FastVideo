@@ -13,6 +13,7 @@ from fastvideo.models.utils import set_weight_attrs
 
 
 class TestAbsMaxFP8LinearMethod(unittest.TestCase):
+
     def test_convert_scale_none(self):
         method = AbsMaxFP8LinearMethod()
         scale = method._convert_scale(None)
@@ -34,6 +35,9 @@ class TestAbsMaxFP8LinearMethod(unittest.TestCase):
             method._convert_scale(scale)
 
     def test_create_weights_rejects_invalid_dtype(self):
+        # float64 is outside the supported set (bf16/fp16/fp32). The test
+        # originally passed float32, which create_weights has accepted since
+        # PR #981 — it never ran in CI, so the mismatch went unnoticed.
         method = AbsMaxFP8LinearMethod()
         layer = nn.Module()
         with self.assertRaisesRegex(AssertionError, "only supports"):
@@ -43,7 +47,7 @@ class TestAbsMaxFP8LinearMethod(unittest.TestCase):
                 output_partition_sizes=[3],
                 input_size=2,
                 output_size=3,
-                params_dtype=torch.float32,
+                params_dtype=torch.float64,
             )
 
     def test_absmax_fp8_parameter_weight_loader(self):
@@ -78,17 +82,14 @@ class TestAbsMaxFP8LinearMethod(unittest.TestCase):
             output_size=2,
             params_dtype=torch.float16,
         )
-        weight_fp16 = torch.tensor(
-            [[1.0, -2.0, 3.0], [4.0, 0.5, -1.5]], dtype=torch.float16
-        )
+        weight_fp16 = torch.tensor([[1.0, -2.0, 3.0], [4.0, 0.5, -1.5]], dtype=torch.float16)
         layer.weight.data = weight_fp16.to(dtype=torch.float8_e4m3fn)
         layer.scale_weight.data = torch.tensor([2.0, 3.0], dtype=torch.float32)
         layer.scale_input.data = torch.tensor([4.0], dtype=torch.float32)
         x = torch.tensor([[1.0, 2.0, -1.0]], dtype=torch.float16)
         expected = torch.nn.functional.linear(
             x * layer.scale_input.data.to(dtype=torch.float16),
-            weight_fp16
-            * layer.scale_weight.data.to(dtype=torch.float16).unsqueeze(1),
+            weight_fp16 * layer.scale_weight.data.to(dtype=torch.float16).unsqueeze(1),
         ).to(dtype=torch.float16)
         output = method.apply(layer, x, bias=None)
         assert_close(output, expected)

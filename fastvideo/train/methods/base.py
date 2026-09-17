@@ -197,6 +197,46 @@ class TrainingMethod(torch.nn.Module, ABC):
 
     # -- Shared hooks (override in subclasses as needed) --
 
+    def manages_optimization(self) -> bool:
+        """Whether the method owns backward/optimizer stepping internally.
+
+        Most methods return loss tensors and let :class:`Trainer` handle
+        gradient accumulation, callbacks, optimizer stepping, and scheduler
+        stepping. RL-style methods such as DiffusionNFT need to preserve their
+        own sample-then-inner-train loop, so they can provide a specific
+        ``managed_train_step``.
+        """
+        return False
+
+    def managed_train_step(
+        self,
+        data_stream: Any,
+        iteration: int,
+    ) -> tuple[
+            dict[str, torch.Tensor],
+            dict[str, Any],
+            dict[str, LogScalar],
+    ]:
+        """Run one method-managed step.
+
+        Subclasses that return ``True`` from :meth:`manages_optimization`
+        should override this. The fallback consumes one dataloader batch and
+        delegates to ``single_train_step`` so tests can exercise the hook with
+        tiny fake methods.
+        """
+        return self.single_train_step(next(data_stream), iteration)
+
+    def on_validation_begin(self, iteration: int = 0) -> dict[str, LogScalar]:
+        """Run method-owned validation, if any.
+
+        Pipeline-style validation should remain in callbacks. Methods that
+        intentionally avoid inference pipelines, such as RL methods with their
+        own sampler/reward loop, can override this hook and return metrics for
+        the trainer to log at ``iteration``.
+        """
+        del iteration
+        return {}
+
     def get_grad_clip_targets(
         self,
         iteration: int,
@@ -232,10 +272,9 @@ class TrainingMethod(torch.nn.Module, ABC):
 
         self.student.on_train_start()
 
-    @staticmethod
-    def _infer_attn_kind() -> Literal["dense", "vsa"]:
-        """Derive attn_kind from ``FASTVIDEO_ATTENTION_BACKEND``."""
-        backend = envs.FASTVIDEO_ATTENTION_BACKEND
+    def _infer_attn_kind(self) -> Literal["dense", "vsa"]:
+        """Derive metadata mode from the student's resolved backend."""
+        backend = (self.student.attention_backend_name or envs.FASTVIDEO_ATTENTION_BACKEND)
         if backend == "VIDEO_SPARSE_ATTN":
             return "vsa"
         return "dense"

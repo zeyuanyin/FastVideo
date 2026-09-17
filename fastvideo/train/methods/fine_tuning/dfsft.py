@@ -35,6 +35,7 @@ class DiffusionForcingSFTMethod(TrainingMethod):
 
         self._chunk_size = self._parse_chunk_size(self.method_config.get("chunk_size", None))
         self._timestep_index_range = (self._parse_timestep_index_range())
+        self._training_weights = self._build_training_weights()
 
         # Initialize preprocessors on student.
         self.student.init_preprocessors(self.training_config)
@@ -134,22 +135,35 @@ class DiffusionForcingSFTMethod(TrainingMethod):
             t_inhom.flatten(),
         )
 
-        pred = self.student.predict_noise(
+        pred = self._predict_noise(
             noisy_latents,
             t_inhom,
             training_batch,
-            conditional=True,
-            attn_kind=self._attn_kind,
+            clean_latents,
         )
 
         if bool(self.training_config.model.precondition_outputs):
             sigmas = schedule_sigmas[timestep_indices]
             sigmas = sigmas.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
             pred_x0 = noisy_latents - pred * sigmas
-            loss = F.mse_loss(pred_x0.float(), clean_latents.float())
+            per_frame_loss = F.mse_loss(
+                pred_x0.float(),
+                clean_latents.float(),
+                reduction="none",
+            ).mean(dim=(2, 3, 4))
         else:
             target = noise - clean_latents
-            loss = F.mse_loss(pred.float(), target.float())
+            per_frame_loss = F.mse_loss(
+                pred.float(),
+                target.float(),
+                reduction="none",
+            ).mean(dim=(2, 3, 4))
+
+        weight = self._get_training_weight(
+            timestep_indices,
+            clean_latents.device,
+        ).reshape(batch_size, num_latents)
+        loss = (per_frame_loss * weight).mean()
 
         attn_metadata = training_batch.attn_metadata_vsa if self._attn_kind == "vsa" else training_batch.attn_metadata
 
@@ -162,6 +176,23 @@ class DiffusionForcingSFTMethod(TrainingMethod):
         }
         metrics: dict[str, LogScalar] = {}
         return loss_map, outputs, metrics
+
+    def _predict_noise(
+        self,
+        noisy_latents: torch.Tensor,
+        timestep: torch.Tensor,
+        training_batch: Any,
+        clean_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        # Unused here; the teacher-forcing subclass overrides this to pass clean_x.
+        del clean_latents
+        return self.student.predict_noise(
+            noisy_latents,
+            timestep,
+            training_batch,
+            conditional=True,
+            attn_kind=self._attn_kind,
+        )
 
     # TrainingMethod override: backward
     def backward(
@@ -317,3 +348,27 @@ class DiffusionForcingSFTMethod(TrainingMethod):
         )
         expanded = chunk_indices.repeat_interleave(chunk_size, dim=1)
         return expanded[:, :num_latents]
+
+    def _build_training_weights(self) -> torch.Tensor:
+        """Gaussian weighting over timestep indices.
+
+        Emphasizes mid-noise timesteps, down-weights extremes
+        (near-clean and pure-noise). Matches Causal-Forcing's
+        bsmntw weighting scheme.
+        """
+        scheduler = self.student.noise_scheduler
+        if scheduler is None:
+            raise ValueError("DFSFT requires student.noise_scheduler")
+        n = float(len(scheduler.timesteps))
+        x = torch.arange(n, dtype=torch.float32)
+        y = torch.exp(-2 * ((x - n / 2) / n)**2)
+        y_shifted = y - y.min()
+        return y_shifted * (n / y_shifted.sum())
+
+    def _get_training_weight(
+        self,
+        timestep_indices: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Look up per-frame gaussian weights by timestep index."""
+        return self._training_weights.to(device)[timestep_indices]

@@ -25,6 +25,7 @@ models:
     disable_custom_init_weights: false                # default: false
     flow_shift: 3.0                                   # default: 3.0
     enable_gradient_checkpointing_type: null           # default: null (falls back to training.model)
+    attention_backend: null                            # default: null (global/default); role-local when set
 
   teacher:
     _target_: fastvideo.train.models.wan.WanModel
@@ -52,6 +53,8 @@ method:
   rollout_mode: simulate              # required: "simulate" or "data_latent"
   generator_update_interval: 5        # default: 1
   dmd_denoising_steps: [1000, 750, 500, 250]  # SDE timestep schedule
+  min_timestep_ratio: 0.0            # score-model timestep lower bound
+  max_timestep_ratio: 1.0            # score-model timestep upper bound
 
   # Critic optimizer (all required — no fallback)
   fake_score_learning_rate: 8.0e-6
@@ -87,6 +90,7 @@ training:
   # --- training.data [TYPED] -> DataConfig ---
   data:
     data_path: data/my_dataset        # default: ""
+    preprocessed_data_type: t2v       # default: "t2v" ("text_only" for simulate-only DMD text prompts)
     train_batch_size: 1               # default: 1
     dataloader_num_workers: 4         # default: 0
     training_cfg_rate: 0.1            # default: 0.0
@@ -129,6 +133,11 @@ training:
   # --- training.vsa [TYPED] -> VSAConfig ---
   vsa:
     sparsity: 0.0                     # default: 0.0 (0.0 = disabled)
+    cache_tile_buf: false             # default: false. Reuse the per-step padded
+                                      # VSA tile buffer across attention layers.
+                                      # Off by default to avoid the activation-
+                                      # checkpointing OOM (#1423); set true on
+                                      # memory-rich setups for the buffer-reuse speedup.
 
   # --- training.model [TYPED] -> ModelTrainingConfig ---
   model:
@@ -186,6 +195,10 @@ callbacks:
 # ------------------------------------------------------------------------------
 pipeline:
   flow_shift: 3                       # default: null (model-specific)
+  # LTX-2 linear QAT (SM100+ with FlashInfer); distinct from the role-local
+  # attention_backend option above, which selects attention math for Wan.
+  # dit_config:
+  #   quant_config: nvfp4_qat_train
   # flow_shift_sr: null               # default: null (super-resolution shift)
   # embedded_cfg_scale: 6.0           # default: 6.0
   # is_causal: false                  # default: false

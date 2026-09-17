@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 
 from fastvideo.distributed import get_sp_group, get_world_group
 from fastvideo.train.callbacks.callback import CallbackDict
-from fastvideo.train.methods.base import TrainingMethod
+from fastvideo.train.methods.base import LogScalar, TrainingMethod
 from fastvideo.train.utils.tracking import build_tracker
 
 if TYPE_CHECKING:
@@ -20,12 +20,22 @@ if TYPE_CHECKING:
         TrainingConfig, )
 
 
-def _coerce_log_scalar(value: Any, *, where: str) -> float:
+def _coerce_log_scalar(
+    value: Any,
+    *,
+    where: str,
+) -> float | torch.Tensor:
+    """Coerce *value* to a loggable scalar.
+
+    GPU tensors stay on device so we avoid a
+    ``cudaDeviceSynchronize`` per accumulation step.
+    The caller must materialize them to float when logging.
+    """
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
             raise ValueError(f"Expected scalar tensor at {where}, "
                              f"got shape={tuple(value.shape)}")
-        return float(value.detach().item())
+        return value.detach()
     if isinstance(value, float | int):
         return float(value)
     raise TypeError(f"Expected a scalar (float/int/Tensor) at "
@@ -72,6 +82,22 @@ class Trainer:
                 batch = next(data_iter)
             yield batch
 
+    def _run_method_validation(
+        self,
+        method: TrainingMethod,
+        iteration: int,
+    ) -> None:
+        hook = getattr(method, "on_validation_begin", None)
+        if hook is None:
+            return
+        validation_metrics: dict[str, LogScalar] = hook(iteration)
+        validation_metrics = {
+            k: float(_coerce_log_scalar(v, where=(f"method.on_validation_begin().metrics[{k!r}]")))
+            for k, v in validation_metrics.items()
+        }
+        if self.global_rank == 0 and validation_metrics:
+            self.tracker.log(validation_metrics, iteration)
+
     def run(
         self,
         method: TrainingMethod,
@@ -105,6 +131,7 @@ class Trainer:
             method,
             iteration=start_step,
         )
+        self._run_method_validation(method, start_step)
         method.optimizers_zero_grad(start_step)
 
         data_stream = self._iter_dataloader(dataloader)
@@ -120,48 +147,78 @@ class Trainer:
             desc="Steps",
             disable=self.local_rank > 0,
         )
+        # Allow method-specific optimization flow (e.g. DiffusionNFT).
+        method_manages_optimization = bool(method.manages_optimization())
         for step in progress:
             t0 = time.perf_counter()
 
-            loss_sums: dict[str, float] = {}
-            metric_sums: dict[str, float] = {}
-            for accum_iter in range(grad_accum):
-                batch = next(data_stream)
-                loss_map, outputs, step_metrics = method.single_train_step(
-                    batch,
+            # Accumulate on GPU during grad-accum; materialise
+            # to CPU once per step right before logging.
+            loss_sums: dict[str, float | torch.Tensor] = {}
+            metric_sums: dict[str, float | torch.Tensor] = {}
+            if method_manages_optimization:
+                loss_map, outputs, step_metrics = method.managed_train_step(
+                    data_stream,
                     step,
                 )
-
-                method.backward(
-                    loss_map,
-                    outputs,
-                    grad_accum_rounds=grad_accum,
-                )
-
                 for k, v in loss_map.items():
                     if isinstance(v, torch.Tensor):
-                        loss_sums[k] = loss_sums.get(k, 0.0) + float(v.detach().item())
+                        loss_sums[k] = v.detach()
                 for k, v in step_metrics.items():
                     if k in loss_sums:
                         raise ValueError(f"Metric key {k!r} collides "
                                          "with loss key. Use a "
                                          "different name (e.g. prefix "
                                          "with 'train/').")
-                    metric_sums[k] = metric_sums.get(k, 0.0) + _coerce_log_scalar(
+                    metric_sums[k] = _coerce_log_scalar(
                         v,
-                        where=("method.single_train_step()"
+                        where=("method.managed_train_step()"
                                f".metrics[{k!r}]"),
                     )
+            else:
+                for accum_iter in range(grad_accum):
+                    batch = next(data_stream)
+                    loss_map, outputs, step_metrics = (method.single_train_step(
+                        batch,
+                        step,
+                    ))
 
-            self.callbacks.on_before_optimizer_step(
-                method,
-                iteration=step,
-            )
-            method.optimizers_schedulers_step(step)
-            method.optimizers_zero_grad(step)
+                    method.backward(
+                        loss_map,
+                        outputs,
+                        grad_accum_rounds=grad_accum,
+                    )
 
-            metrics = {k: v / grad_accum for k, v in loss_sums.items()}
-            metrics.update({k: v / grad_accum for k, v in metric_sums.items()})
+                    for k, v in loss_map.items():
+                        if isinstance(v, torch.Tensor):
+                            prev = loss_sums.get(k, 0.0)
+                            loss_sums[k] = prev + v.detach()
+                    for k, v in step_metrics.items():
+                        if k in loss_sums:
+                            raise ValueError(f"Metric key {k!r} collides "
+                                             "with loss key. Use a "
+                                             "different name (e.g. prefix "
+                                             "with 'train/').")
+                        prev = metric_sums.get(k, 0.0)
+                        metric_sums[k] = (prev + _coerce_log_scalar(
+                            v,
+                            where=("method.single_train_step()"
+                                   f".metrics[{k!r}]"),
+                        ))
+
+            if not method_manages_optimization:
+                self.callbacks.on_before_optimizer_step(
+                    method,
+                    iteration=step,
+                )
+                method.optimizers_schedulers_step(step)
+                method.optimizers_zero_grad(step)
+
+            # Single CPU sync point: materialise GPU tensors
+            # to float right before logging.
+            divisor = 1 if method_manages_optimization else grad_accum
+            metrics = {k: float(v) / divisor for k, v in loss_sums.items()}
+            metrics.update({k: float(v) / divisor for k, v in metric_sums.items()})
             metrics["step_time_sec"] = (time.perf_counter() - t0)
             metrics["vsa_sparsity"] = float(tc.vsa_sparsity)
             if self.global_rank == 0 and metrics:
@@ -180,6 +237,7 @@ class Trainer:
                 method,
                 iteration=step,
             )
+            self._run_method_validation(method, step)
             self.callbacks.on_validation_end(
                 method,
                 iteration=step,

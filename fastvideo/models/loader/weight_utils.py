@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/model_loader/weight_utils.py
 """Utilities for downloading and initializing model weights."""
+import glob
 import hashlib
 import json
 import os
@@ -11,11 +12,27 @@ from pathlib import Path
 import filelock
 import huggingface_hub.constants
 import torch
+import torch.distributed as dist
 from safetensors.torch import safe_open
 from tqdm.auto import tqdm
 
-from fastvideo.distributed import get_local_torch_device
+import fastvideo.distributed.parallel_state as parallel_state
 from fastvideo.logger import init_logger
+
+SAFETENSORS_TO_TORCH_DTYPE = {
+    'F16': torch.float16,
+    'BF16': torch.bfloat16,
+    'F32': torch.float32,
+    'F64': torch.float64,
+    'I8': torch.int8,
+    'I16': torch.int16,
+    'I32': torch.int32,
+    'I64': torch.int64,
+    'U8': torch.uint8,
+    'BOOL': torch.bool,
+    'F8_E4M3': torch.float8_e4m3fn,
+    'F8_E5M2': torch.float8_e5m2,
+}
 
 logger = init_logger(__name__)
 
@@ -65,9 +82,7 @@ def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
 # Passing both of these to the weight loader functionality breaks.
 # So, we use the index_file to
 # look up which safetensors files should be used.
-def filter_duplicate_safetensors_files(hf_weights_files: list[str],
-                                       hf_folder: str,
-                                       index_file: str) -> list[str]:
+def filter_duplicate_safetensors_files(hf_weights_files: list[str], hf_folder: str, index_file: str) -> list[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, index_file)
@@ -80,17 +95,27 @@ def filter_duplicate_safetensors_files(hf_weights_files: list[str],
         weight_map = json.load(f)["weight_map"]
     weight_files_in_index = set()
     for weight_name in weight_map:
-        weight_files_in_index.add(
-            os.path.join(hf_folder, weight_map[weight_name]))
+        weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
     # Filter out any fields that are not found in the index file.
-    hf_weights_files = [
-        f for f in hf_weights_files if f in weight_files_in_index
-    ]
+    hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
 
 
-def filter_files_not_needed_for_inference(
-        hf_weights_files: list[str]) -> list[str]:
+SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+
+
+def resolve_safetensors_files(model_path: str) -> list[str]:
+    """Discover safetensors files in a model directory."""
+    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not files:
+        raise FileNotFoundError(f"No .safetensors files found in {model_path}")
+    index_file = os.path.join(model_path, SAFE_WEIGHTS_INDEX_NAME)
+    if os.path.exists(index_file):
+        files = filter_duplicate_safetensors_files(files, model_path, SAFE_WEIGHTS_INDEX_NAME)
+    return files
+
+
+def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
     """
     Exclude files that are not needed for inference.
 
@@ -103,10 +128,7 @@ def filter_files_not_needed_for_inference(
         "scheduler.pt",
         "scaler.pt",
     ]
-    hf_weights_files = [
-        f for f in hf_weights_files
-        if not any(f.endswith(x) for x in blacklist)
-    ]
+    hf_weights_files = [f for f in hf_weights_files if not any(f.endswith(x) for x in blacklist)]
     return hf_weights_files
 
 
@@ -117,14 +139,35 @@ def filter_files_not_needed_for_inference(
 _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
 
-def safetensors_weights_iterator(
-    hf_weights_files: list[str],
-    to_cpu: bool = True,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
-    enable_tqdm = not torch.distributed.is_initialized(
-    ) or torch.distributed.get_rank() == 0
-    device = "cpu" if to_cpu else str(get_local_torch_device())
+def _get_initialized_node_group():
+    # Single-rank / pytest paths may not have initialized the node group.
+    # Fall through to the old get_local_torch_device() behavior when uninitialized.
+    if torch.distributed.is_initialized() and parallel_state._NODE is not None:
+        return parallel_state.get_node_group()
+    return None
+
+
+def safetensors_weights_iterator(hf_weights_files: list[str],
+                                 to_cpu: bool = False,
+                                 broadcast: bool = True,
+                                 async_broadcast: bool = False) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files.
+    Args:
+        hf_weights_files: List of safetensor files to load.
+        to_cpu: Whether to load the weights to CPU. If False, will load to the GPU device bound to the current
+            process.
+        broadcast: Whether local rank 0 should read GPU weights and broadcast them to the other local ranks.
+        async_broadcast: Whether to overlap loading from disk and broadcasting to other ranks. If True,
+            must iterate over all the weights before use. Only used when broadcast is True and to_cpu is False.
+    """
+    node_group = _get_initialized_node_group()
+    local_rank = node_group.local_rank if node_group is not None else int(os.environ.get("LOCAL_RANK", 0))
+    device = str(parallel_state.get_local_torch_device()) if not to_cpu else "cpu"
+    enable_tqdm = not torch.distributed.is_initialized() or local_rank == 0
+    if to_cpu or not broadcast or node_group is None:
+        async_broadcast = False
+
+    handles = []
     for st_file in tqdm(
             hf_weights_files,
             desc="Loading safetensors checkpoint shards",
@@ -133,18 +176,53 @@ def safetensors_weights_iterator(
     ):
         with safe_open(st_file, framework="pt", device=device) as f:
             for name in f.keys():  # noqa: SIM118
-                param = f.get_tensor(name)
+                if to_cpu:
+                    param = f.get_tensor(name)
+                elif broadcast and node_group is not None:
+                    if local_rank == 0:
+                        param = f.get_tensor(name)
+                    else:
+                        sl = f.get_slice(name)
+                        shape = sl.get_shape()
+                        dtype = SAFETENSORS_TO_TORCH_DTYPE[sl.get_dtype()]
+                        param = torch.empty(shape, device=device, dtype=dtype)
+                    # broadcast to local ranks
+                    # TODO(Wenxuan): scatter instead of broadcast
+                    if node_group.world_size > 1:
+                        group = node_group.device_group
+                        if async_broadcast:
+                            handle = dist.broadcast(param,
+                                                    src=dist.get_global_rank(group, 0),
+                                                    async_op=True,
+                                                    group=group)
+                            handles.append(handle)
+                        else:
+                            dist.broadcast(param, src=dist.get_global_rank(group, 0), group=group)
+                else:
+                    param = f.get_tensor(name)
                 yield name, param
 
+        if async_broadcast:
+            for handle in handles:
+                handle.wait()
+            handles.clear()
 
-def pt_weights_iterator(
-    hf_weights_files: list[str],
-    to_cpu: bool = True,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model bin/pt files."""
-    device = "cpu" if to_cpu else str(get_local_torch_device())
-    enable_tqdm = not torch.distributed.is_initialized(
-    ) or torch.distributed.get_rank() == 0
+
+def pt_weights_iterator(hf_weights_files: list[str],
+                        to_cpu: bool = False,
+                        broadcast: bool = True) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model bin/pt files.
+
+    Args:
+        hf_weights_files: List of bin/pt files to load.
+        to_cpu: Whether to load the weights to CPU.
+        broadcast: Accepted for API symmetry. PT weights are loaded through
+            torch.load and do not use the safetensors broadcast path.
+    """
+    node_group = _get_initialized_node_group()
+    local_rank = node_group.local_rank if node_group is not None else int(os.environ.get("LOCAL_RANK", 0))
+    device = str(parallel_state.get_local_torch_device()) if not to_cpu else "cpu"
+    enable_tqdm = not torch.distributed.is_initialized() or local_rank == 0
     for bin_file in tqdm(
             hf_weights_files,
             desc="Loading pt checkpoint shards",
@@ -156,8 +234,7 @@ def pt_weights_iterator(
         del state
 
 
-def default_weight_loader(param: torch.Tensor,
-                          loaded_weight: torch.Tensor) -> None:
+def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
         if param.numel() == 1 and loaded_weight.numel() == 1:
@@ -166,9 +243,8 @@ def default_weight_loader(param: torch.Tensor,
             # "broadcast" instead of copy
             param.data.fill_(loaded_weight.item())
         else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})")
+            assert param.size() == loaded_weight.size(), (f"Attempted to load weight ({loaded_weight.size()}) "
+                                                          f"into parameter ({param.size()})")
 
             param.data.copy_(loaded_weight)
     except Exception:
@@ -195,42 +271,35 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
         None: If the remapped name is not found in params_dict.
     """
     if name.endswith(".kv_scale"):
-        logger.warning_once(
-            "DEPRECATED. Found kv_scale in the checkpoint. "
-            "This format is deprecated in favor of separate k_scale and "
-            "v_scale tensors and will be removed in a future release. "
-            "Functionally, we will remap kv_scale to k_scale and duplicate "
-            "k_scale to v_scale")
+        logger.warning_once("DEPRECATED. Found kv_scale in the checkpoint. "
+                            "This format is deprecated in favor of separate k_scale and "
+                            "v_scale tensors and will be removed in a future release. "
+                            "Functionally, we will remap kv_scale to k_scale and duplicate "
+                            "k_scale to v_scale")
         # NOTE: we remap the deprecated kv_scale to k_scale
         remapped_name = name.replace(".kv_scale", ".attn.k_scale")
         if remapped_name not in params_dict:
-            logger.warning_once(
-                f"Found kv_scale in the checkpoint (e.g. {name}), "
-                "but not found the expected name in the model "
-                f"(e.g. {remapped_name}). kv_scale is "
-                "not loaded.")
+            logger.warning_once(f"Found kv_scale in the checkpoint (e.g. {name}), "
+                                "but not found the expected name in the model "
+                                f"(e.g. {remapped_name}). kv_scale is "
+                                "not loaded.")
             return None
         return remapped_name
 
     possible_scale_names = [".k_scale", ".v_scale"]
-    modelopt_scale_names = [
-        ".self_attn.k_proj.k_scale", ".self_attn.v_proj.v_scale"
-    ]
+    modelopt_scale_names = [".self_attn.k_proj.k_scale", ".self_attn.v_proj.v_scale"]
     for scale_name in possible_scale_names:
         if name.endswith(scale_name):
-            if any(mo_scale_name in name
-                   for mo_scale_name in modelopt_scale_names):
-                remapped_name = name.replace(
-                    f".self_attn.{scale_name[1]}_proj{scale_name}",
-                    f".self_attn.attn{scale_name}")
+            if any(mo_scale_name in name for mo_scale_name in modelopt_scale_names):
+                remapped_name = name.replace(f".self_attn.{scale_name[1]}_proj{scale_name}",
+                                             f".self_attn.attn{scale_name}")
             else:
                 remapped_name = name.replace(scale_name, f".attn{scale_name}")
             if remapped_name not in params_dict:
-                logger.warning_once(
-                    f"Found {scale_name} in the checkpoint (e.g. {name}), "
-                    "but not found the expected name in the model "
-                    f"(e.g. {remapped_name}). {scale_name} is "
-                    "not loaded.")
+                logger.warning_once(f"Found {scale_name} in the checkpoint (e.g. {name}), "
+                                    "but not found the expected name in the model "
+                                    f"(e.g. {remapped_name}). {scale_name} is "
+                                    "not loaded.")
                 return None
             return remapped_name
 

@@ -6,7 +6,7 @@ This directory contains the FastVideo documentation built with MkDocs.
 
 ```bash
 # Install dependencies
-pip install -r requirements-mkdocs.txt
+uv pip install -r requirements-mkdocs.txt
 
 # Serve docs with live reload (recommended for development)
 mkdocs serve
@@ -36,4 +36,15 @@ Then open your browser to: http://localhost:8000
 
 ## Automatic Deployment
 
-Documentation is automatically built and deployed to GitHub Pages when changes are pushed to the `main` branch via the `.github/workflows/docs.yml` workflow.
+Documentation is automatically built and deployed to GitHub Pages when changes are pushed to the `main` branch via the `.github/workflows/infra-docs.yml` workflow.
+
+## Update documentation dependencies
+
+Edit `requirements-mkdocs.in`, then regenerate the pinned Linux/Python 3.12 lock file:
+
+```bash
+uv pip compile requirements-mkdocs.in \
+  -o requirements-mkdocs.txt \
+  --python-platform x86_64-manylinux_2_28 \
+  --python-version 3.12
+```

@@ -4,10 +4,11 @@ This page contains step-by-step instructions to get you quickly started with vid
 
 ## Requirements
 
-- **OS**: Linux (Tested on Ubuntu 22.04+)
+- **OS**: Linux (tested on Ubuntu 22.04+), or macOS on Apple silicon via the
+  [MPS installation guide](../getting_started/installation/mps.md)
 - **Python**: 3.10-3.12
-- **CUDA**: 12.8
-- **GPU**: At least one NVIDIA GPU
+- **CUDA**: 12.6 or 13.0 (NVIDIA GPUs)
+- **GPU**: At least one NVIDIA GPU, or an Apple silicon chip with MPS
 
 ## Installation
 
@@ -19,8 +20,10 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 # Install FastVideo
-uv pip install fastvideo
+UV_TORCH_BACKEND=cu126 uv pip install fastvideo
 ```
+
+Use `UV_TORCH_BACKEND=cu130` instead on CUDA 13.
 
 For advanced installation options, see the [Installation Guide](../getting_started/installation.md).
 
@@ -107,6 +110,8 @@ If you encounter CUDA out of memory errors:
   (single GPU) or `use_fsdp_inference=True` (multi-GPU)
 - Try a smaller model or use distilled versions
 - Use `num_gpus` > 1 if multiple GPUs are available
+- Try enabling FSDP inference with `use_fsdp_inference=True` (may slow down generation)
+- Try enabling DiT layerwise offload with `dit_layerwise_offload=True` (now only a few models support this, but may introduce less overhead than FSDP)
 
 ### Slow Generation
 
@@ -130,5 +135,4 @@ If the generated video doesn't match your prompt:
 - Learn about [Advanced Inference Configurations](configuration.md)
 - Learn about using [Optimizations](optimizations.md)
 - See [Examples](examples/examples_inference_index.md) for more usage scenarios
-- Join our [Community Discord](https://discord.gg/JA7cksDz86).
-- Join our [Community Slack](https://join.slack.com/t/fastvideo/shared_invite/zt-38u6p1jqe-yDI1QJOCEnbtkLoaI5bjZQ).
+- Join our [Community Slack](https://join.slack.com/t/fastvideo/shared_invite/zt-3f4lao1uq-u~Ipx6Lt4J27AlD2y~IdLQ).

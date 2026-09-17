@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from fastvideo import VideoGenerator
-from fastvideo.configs.sample import SamplingParam
+from fastvideo.api.sampling_param import SamplingParam
 
 
 def main():
@@ -50,4 +50,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -27,7 +27,7 @@ try:
     from fastvideo.attention.backends.vmoba import VideoMobaAttentionMetadataBuilder
 except Exception:
     pass
-from fastvideo.configs.sample import SamplingParam
+from fastvideo.api.sampling_param import SamplingParam
 from fastvideo.dataset import build_parquet_map_style_dataloader
 from fastvideo.dataset.dataloader.schema import pyarrow_schema_t2v
 from fastvideo.dataset.validation_dataset import ValidationDataset
@@ -35,6 +35,7 @@ from fastvideo.distributed import (cleanup_dist_env_and_memory, get_local_torch_
 from fastvideo.fastvideo_args import FastVideoArgs, TrainingArgs
 from fastvideo.forward_context import set_forward_context
 from fastvideo.logger import init_logger
+from fastvideo.models.vision_utils import load_video
 from fastvideo.pipelines import (ComposedPipelineBase, ForwardBatch, LoRAPipeline, TrainingBatch)
 from fastvideo.platforms import current_platform
 from fastvideo.training.activation_checkpoint import (apply_activation_checkpointing)
@@ -80,6 +81,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
         set_random_seed(fastvideo_args.seed)  # for lora param init
         super().__init__(model_path, fastvideo_args, required_config_modules, loaded_modules)  # type: ignore
         self.tracker = DummyTracker()
+        self.validation_ref_videos_logged = False
 
     def create_pipeline_stages(self, fastvideo_args: FastVideoArgs):
         raise RuntimeError("create_pipeline_stages should not be called for training pipeline")
@@ -244,11 +246,21 @@ class TrainingPipeline(LoRAPipeline, ABC):
             encoder_attention_mask = batch['text_attention_mask']
             infos = batch['info_list']
 
-            training_batch.latents = latents.to(get_local_torch_device(), dtype=torch.bfloat16)
-            training_batch.encoder_hidden_states = encoder_hidden_states.to(get_local_torch_device(),
-                                                                            dtype=torch.bfloat16)
-            training_batch.encoder_attention_mask = encoder_attention_mask.to(get_local_torch_device(),
-                                                                              dtype=torch.bfloat16)
+            training_batch.latents = latents.to(
+                get_local_torch_device(),
+                dtype=torch.bfloat16,
+                non_blocking=True,
+            )
+            training_batch.encoder_hidden_states = (encoder_hidden_states.to(
+                get_local_torch_device(),
+                dtype=torch.bfloat16,
+                non_blocking=True,
+            ))
+            training_batch.encoder_attention_mask = (encoder_attention_mask.to(
+                get_local_torch_device(),
+                dtype=torch.bfloat16,
+                non_blocking=True,
+            ))
             training_batch.infos = infos
 
         return training_batch
@@ -347,7 +359,8 @@ class TrainingPipeline(LoRAPipeline, ABC):
                 current_timestep=training_batch.timesteps,
                 patch_size=patch_size,
                 VSA_sparsity=current_vsa_sparsity,
-                device=get_local_torch_device())
+                device=get_local_torch_device(),
+                cache_tile_buf=self.training_args.VSA_cache_tile_buf)
         elif envs.FASTVIDEO_ATTENTION_BACKEND == "VMOBA_ATTN":
             if not vmoba_available:
                 raise ImportError("FASTVIDEO_ATTENTION_BACKEND is set to VMOBA_ATTN, "
@@ -409,12 +422,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
             avg_loss = loss.detach().clone()
 
-        # logger.info(f"rank: {self.rank}, avg_loss: {avg_loss.item()}",
-        #             local_main_process_only=False)
+        # Reduce across ranks without forcing a CPU sync
         with self.tracker.timed("timing/reduce_loss"):
             world_group = get_world_group()
             avg_loss = world_group.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-        training_batch.total_loss += avg_loss.item()
+        # Accumulate on GPU; materialize to CPU only once after
+        # all gradient-accumulation iterations (see train_one_step).
+        training_batch.total_loss += avg_loss
 
         return training_batch
 
@@ -437,8 +451,11 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     max_grad_norm,
                     foreach=None,
                 )
-                assert grad_norm is not float('nan') or grad_norm is not float('inf')
-                grad_norm = grad_norm.item() if grad_norm is not None else 0.0
+                if grad_norm is not None:
+                    assert torch.isfinite(grad_norm), (f"grad_norm is not finite: {grad_norm}")
+                    grad_norm = grad_norm.item()
+                else:
+                    grad_norm = 0.0
         else:
             grad_norm = 0.0
         training_batch.grad_norm = grad_norm
@@ -556,7 +573,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
             training_batch.current_vsa_sparsity = current_vsa_sparsity
             training_batch = self.train_one_step(training_batch)
 
-            loss = training_batch.total_loss
+            loss = float(training_batch.total_loss)
             grad_norm = training_batch.grad_norm
 
             step_time = time.perf_counter() - start_time
@@ -674,7 +691,6 @@ class TrainingPipeline(LoRAPipeline, ABC):
         sampling_param.num_frames = num_frames
         batch = ForwardBatch(
             **shallow_asdict(sampling_param),
-            latents=None,
             generator=self.validation_random_generator,
             n_tokens=n_tokens,
             eta=0.0,
@@ -727,6 +743,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
                         local_main_process_only=False)
             step_videos: list[np.ndarray] = []
             step_captions: list[str] = []
+            step_ref_videos: list[str | None] = []
 
             step_audio: list[np.ndarray | None] = []
             step_sample_rates: list[int | None] = []
@@ -742,6 +759,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
                 assert batch.prompt is not None and isinstance(batch.prompt, str)
                 step_captions.append(batch.prompt)
+                step_ref_videos.append(validation_batch.get("ref_video"))
 
                 # Run validation inference
                 output_batch = self.validation_pipeline.forward(batch, training_args)
@@ -775,6 +793,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
                 # Global rank 0 collects results from all sp_group leaders
                 all_videos = step_videos  # Start with own results
                 all_captions = step_captions
+                all_ref_videos = step_ref_videos
                 all_audios = step_audio
                 all_sample_rates = step_sample_rates
 
@@ -783,11 +802,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     src_rank = sp_group_idx * self.sp_world_size  # Global rank of other sp_group leaders
                     recv_videos = world_group.recv_object(src=src_rank)
                     recv_captions = world_group.recv_object(src=src_rank)
+                    recv_ref_videos = world_group.recv_object(src=src_rank)
                     recv_audios = world_group.recv_object(src=src_rank)
                     recv_sample_rates = world_group.recv_object(src=src_rank)
 
                     all_videos.extend(recv_videos)
                     all_captions.extend(recv_captions)
+                    all_ref_videos.extend(recv_ref_videos)
                     all_audios.extend(recv_audios)
                     all_sample_rates.extend(recv_sample_rates)
 
@@ -810,16 +831,30 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
                 artifacts = []
                 for filename, caption in zip(video_filenames, all_captions, strict=True):
-                    video_artifact = self.tracker.video(filename, caption=caption)
+                    video_artifact = self.tracker.video(filename, caption=caption, fps=sampling_param.fps)
                     if video_artifact is not None:
                         artifacts.append(video_artifact)
                 if artifacts:
                     logs = {f"validation_videos_{num_inference_steps}_steps": artifacts}
                     self.tracker.log_artifacts(logs, global_step)
+                if not self.validation_ref_videos_logged:
+                    ref_artifacts = []
+                    for ref_filename, caption in zip(all_ref_videos, all_captions, strict=True):
+                        if ref_filename is None:
+                            continue
+                        ref_frames = np.stack([np.asarray(frame) for frame in load_video(ref_filename)], axis=0)
+                        ref_frames = np.ascontiguousarray(ref_frames.transpose(0, 3, 1, 2))
+                        video_artifact = self.tracker.video(ref_frames, caption=caption, fps=sampling_param.fps)
+                        if video_artifact is not None:
+                            ref_artifacts.append(video_artifact)
+                    if ref_artifacts:
+                        self.tracker.log_artifacts({"validation_ref_videos": ref_artifacts}, global_step)
+                        self.validation_ref_videos_logged = True
             elif self.rank_in_sp_group == 0:
                 # Other sp_group leaders send their results to global rank 0
                 world_group.send_object(step_videos, dst=0)
                 world_group.send_object(step_captions, dst=0)
+                world_group.send_object(step_ref_videos, dst=0)
                 world_group.send_object(step_audio, dst=0)
                 world_group.send_object(step_sample_rates, dst=0)
 
@@ -840,7 +875,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
             import av
         except ImportError:
             logger.warning("PyAV not installed; cannot mux audio. "
-                           "Install with: pip install av")
+                           "Install with: uv pip install av")
             return False
 
         if torch.is_tensor(audio):

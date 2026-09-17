@@ -181,6 +181,8 @@ class SortedHelpFormatter(argparse.HelpFormatter):
 class FlexibleArgumentParser(argparse.ArgumentParser):
     """ArgumentParser that allows both underscore and dash in names."""
 
+    _DEFER_CONFIG_SUBCOMMANDS = frozenset({"generate", "serve"})
+
     def __init__(self, *args, **kwargs) -> None:
         # Set the default 'formatter_class' to SortedHelpFormatter
         if 'formatter_class' not in kwargs:
@@ -189,10 +191,17 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
 
     def parse_args(  # type: ignore[override]
             self, args=None, namespace=None) -> argparse.Namespace:
+        namespace, unknown = self.parse_known_args(args, namespace)
+        if unknown:
+            self.error(f"unrecognized arguments: {' '.join(unknown)}")
+        return namespace
+
+    def parse_known_args(  # type: ignore[override]
+            self, args=None, namespace=None) -> tuple[argparse.Namespace, list[str]]:
         if args is None:
             args = sys.argv[1:]
 
-        if '--config' in args:
+        if '--config' in args and not self._should_defer_config_loading(args):
             args = self._pull_args_from_config(args)
 
         # Convert underscores to dashes and vice versa in argument names
@@ -201,10 +210,16 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
             if arg.startswith('--'):
                 if '=' in arg:
                     key, value = arg.split('=', 1)
-                    key = '--' + key[len('--'):].replace('_', '-')
+                    normalized_key = key[len('--'):]
+                    if '.' not in normalized_key:
+                        normalized_key = normalized_key.replace('_', '-')
+                    key = '--' + normalized_key
                     processed_args.append(f'{key}={value}')
                 else:
-                    processed_args.append('--' + arg[len('--'):].replace('_', '-'))
+                    normalized_key = arg[len('--'):]
+                    if '.' not in normalized_key:
+                        normalized_key = normalized_key.replace('_', '-')
+                    processed_args.append('--' + normalized_key)
             elif arg.startswith('-O') and arg != '-O' and len(arg) == 2:
                 # allow -O flag to be used without space, e.g. -O3
                 processed_args.append('-O')
@@ -212,7 +227,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
             else:
                 processed_args.append(arg)
 
-        namespace = super().parse_args(processed_args, namespace)
+        namespace, unknown = super().parse_known_args(processed_args, namespace)
 
         # Track which arguments were explicitly provided
         namespace._provided = set()
@@ -238,7 +253,15 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
             else:
                 i += 1
 
-        return namespace  # type: ignore[no-any-return]
+        return namespace, unknown  # type: ignore[no-any-return]
+
+    def _should_defer_config_loading(self, args: list[str]) -> bool:
+        if getattr(self, "defer_config_loading", False):
+            return True
+        subcommand = next((arg for arg in args if not arg.startswith('-')), None)
+        if subcommand in self._DEFER_CONFIG_SUBCOMMANDS:
+            return True
+        return self.prog.split()[-1] in self._DEFER_CONFIG_SUBCOMMANDS
 
     def _pull_args_from_config(self, args: list[str]) -> list[str]:
         """Method to pull arguments specified in the config file
@@ -470,17 +493,50 @@ def import_pynvml():
     return pynvml
 
 
-def maybe_download_model(model_name_or_path: str, local_dir: str | None = None, download: bool = True) -> str:
+def _split_hf_repo_subfolder(model_name_or_path: str) -> tuple[str, str | None]:
+    """Split an ``org/repo/subfolder`` reference into its Hub coordinates."""
+    parts = model_name_or_path.split("/")
+    if (len(parts) < 3 or model_name_or_path.startswith("/") or model_name_or_path.startswith(".") or "" in parts):
+        return model_name_or_path, None
+
+    sub_parts = parts[2:]
+    if any(part in (".", "..") for part in sub_parts) or any(char in part for part in sub_parts for char in "*?["):
+        raise ValueError(f"Invalid umbrella-repo subfolder in {model_name_or_path!r}: "
+                         "`.`/`..` segments and glob metacharacters (`*`, `?`, `[`) "
+                         "are not allowed.")
+    return "/".join(parts[:2]), "/".join(sub_parts)
+
+
+def maybe_download_model(
+    model_name_or_path: str,
+    local_dir: str | None = None,
+    download: bool = True,
+    revision: str | None = None,
+    allow_patterns: list[str] | None = None,
+) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
-    
+
+    Supports an "umbrella" repo layout where a single HF repo holds multiple
+    pipeline variants under sibling subfolders. If the input is shaped as
+    ``org/repo/subfolder`` (i.e. a non-existent local path with 3+ slash-
+    separated components and at least one segment that does not look like a
+    posix-absolute path), treat the first two components as the HF repo id
+    and the remainder as a subfolder; only the subfolder's blobs are
+    downloaded, and the returned local path points inside that subfolder.
+
     Args:
-        model_name_or_path: Local path or Hugging Face Hub model ID
+        model_name_or_path: Local path, Hugging Face Hub model ID, or
+            ``org/repo/subfolder`` umbrella-repo reference.
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
-        
+        revision: Optional immutable Hub revision.
+        allow_patterns: Optional Hub glob patterns limiting downloaded files.
+            Local paths are returned unchanged. For umbrella references, the
+            patterns are interpreted relative to the selected subfolder.
+
     Returns:
-        Local path to the model
+        Local path to the model (or to the subfolder inside the snapshot).
     """
 
     # If the path exists locally, return it
@@ -488,13 +544,46 @@ def maybe_download_model(model_name_or_path: str, local_dir: str | None = None, 
         logger.info("Model already exists locally at %s", model_name_or_path)
         return model_name_or_path
 
+    # Detect the umbrella-repo "org/repo/subfolder[/nested]" form. HF Hub
+    # repo ids are exactly two components ("org/name"); anything more is
+    # always a subfolder reference. Local absolute paths are excluded by
+    # the os.path.exists check above and by the leading-slash test below.
+    repo_id, subfolder = _split_hf_repo_subfolder(model_name_or_path)
+
     # Otherwise, assume it's a HF Hub model ID and try to download it
     try:
+        if subfolder is not None:
+            logger.info("Downloading umbrella-repo subfolder %s/%s from HF Hub...", repo_id, subfolder)
+            subfolder_allow_patterns = ([f"{subfolder}/{pattern}" for pattern in allow_patterns]
+                                        if allow_patterns is not None else [f"{subfolder}/**"])
+            with get_lock(model_name_or_path):
+                snapshot_root = snapshot_download(
+                    repo_id=repo_id,
+                    allow_patterns=subfolder_allow_patterns,
+                    local_dir=local_dir,
+                    revision=revision,
+                )
+            # Defense-in-depth: ensure the resolved subfolder path stays
+            # inside the snapshot root and that snapshot_download actually
+            # populated it (allow_patterns can match nothing silently).
+            snapshot_real = os.path.realpath(snapshot_root)
+            local_path = os.path.realpath(os.path.join(snapshot_root, subfolder))
+            if local_path != snapshot_real and not local_path.startswith(snapshot_real + os.sep):
+                raise ValueError(f"Resolved umbrella-repo path {local_path!r} escapes the "
+                                 f"snapshot root {snapshot_real!r}.")
+            if not os.path.isdir(local_path):
+                raise ValueError(f"Subfolder {subfolder!r} was not found inside the snapshot of "
+                                 f"{repo_id!r}; verify it exists in the umbrella repo.")
+            logger.info("Downloaded subfolder to %s", local_path)
+            return str(local_path)
+
         logger.info("Downloading model snapshot from HF Hub for %s...", model_name_or_path)
         with get_lock(model_name_or_path):
             local_path = snapshot_download(repo_id=model_name_or_path,
+                                           allow_patterns=allow_patterns,
                                            ignore_patterns=["*.onnx", "*.msgpack"],
-                                           local_dir=local_dir)
+                                           local_dir=local_dir,
+                                           revision=revision)
         logger.info("Downloaded model to %s", local_path)
         return str(local_path)
     except Exception as e:
@@ -527,90 +616,152 @@ def maybe_download_lora(model_name_or_path: str, local_dir: str | None = None, d
     return os.path.join(local_path, weight_name)
 
 
-def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
+def verify_model_config_and_directory(
+    model_path: str,
+    required_component_dirs: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """
-    Verify that the model directory contains a valid diffusers configuration.
+    Verify that the model directory contains a valid Diffusers configuration.
     
     Args:
         model_path: Path to the model directory
+        required_component_dirs: Component directories required by the selected
+            pipeline. ``None`` preserves full-snapshot validation; an empty
+            collection validates only the manifest.
         
     Returns:
         The loaded model configuration as a dictionary
     """
 
-    # Check for model_index.json which is required for diffusers models
-    config_path = os.path.join(model_path, "model_index.json")
-    if not os.path.exists(config_path):
-        raise ValueError(f"Model directory {model_path} does not contain model_index.json. "
-                         "Only Hugging Face diffusers format is supported.")
+    # Some Diffusers checkpoints publish a modular manifest instead of model_index.json.
+    config_filename = next(
+        (name for name in ("model_index.json", "modular_model_index.json")
+         if os.path.isfile(os.path.join(model_path, name))),
+        None,
+    )
+    if config_filename is None:
+        raise ValueError(f"Model directory {model_path} does not contain model_index.json or "
+                         "modular_model_index.json. Only Hugging Face Diffusers format is supported.")
+    config_path = os.path.join(model_path, config_filename)
 
-    # Check for transformer and vae directories
-    transformer_dir = os.path.join(model_path, "transformer")
-    vae_dir = os.path.join(model_path, "vae")
-
-    if not os.path.exists(transformer_dir):
-        raise ValueError(f"Model directory {model_path} does not contain a transformer/ directory.")
-
-    if not os.path.exists(vae_dir):
-        raise ValueError(f"Model directory {model_path} does not contain a vae/ directory.")
-
-    # Load the config
+    # Load the config first so directory checks below can be conditional on
+    # what the manifest actually declares.
     with open(config_path) as f:
         config = json.load(f)
 
+    if required_component_dirs is not None:
+        for component_dir in required_component_dirs:
+            if not os.path.isdir(os.path.join(model_path, component_dir)):
+                raise ValueError(f"Model directory {model_path} is missing the selected "
+                                 f"{component_dir}/ component directory.")
+    else:
+        # Full snapshots keep the historical invariant that transformer/ is
+        # present and every active manifest component exists locally.
+        transformer_dir = os.path.join(model_path, "transformer")
+        if not os.path.exists(transformer_dir):
+            raise ValueError(f"Model directory {model_path} does not contain a transformer/ directory.")
+
+    # Diffusers convention: component entries start with [library, class].
+    # Modular manifests may append loading metadata, which FastVideo does not
+    # need because published component subfolders match their manifest keys.
+    # Non-list entries are scalar metadata
+    # (e.g. boundary_ratio); a None first element marks a disabled
+    # component (matches composed_pipeline_base.py). Pipelines that
+    # lazy-load shared components from upstream HF repos simply omit the
+    # key, so we only enforce "declared, active, but missing on disk".
+    # Tokenizers are skipped because they often share a directory with
+    # their text encoder (e.g. LTX2's gemma tokenizer lives under
+    # text_encoder/gemma/); the pipeline subclass resolves that fallback
+    # at load time.
+    if required_component_dirs is None:
+        for key, value in config.items():
+            if key.startswith("_") or key == "transformer" or key.startswith("tokenizer"):
+                continue
+            if not isinstance(value, list) or len(value) < 1 or value[0] is None:
+                continue
+            subdir = os.path.join(model_path, key)
+            if not os.path.exists(subdir):
+                raise ValueError(f"Model directory {model_path} declares `{key}` in "
+                                 f"{config_filename} but is missing the {key}/ subfolder.")
+
     # Verify diffusers version exists
     if "_diffusers_version" not in config:
-        raise ValueError("model_index.json does not contain _diffusers_version")
+        raise ValueError(f"{config_filename} does not contain _diffusers_version")
 
     logger.info("Diffusers version: %s", config["_diffusers_version"])
     return cast(dict[str, Any], config)
 
 
-def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
+def maybe_download_model_index(model_name_or_path: str, revision: str | None = None) -> dict[str, Any]:
     """
-    Download and extract just the model_index.json for a Hugging Face model.
+    Download and extract a Diffusers model manifest for a Hugging Face model.
     
     Args:
         model_name_or_path: Path or HF Hub model ID
+        revision: Optional immutable Hub revision.
         
     Returns:
-        The parsed model_index.json as a dictionary
+        The parsed model_index.json or modular_model_index.json dictionary
     """
-    import tempfile
-
     from huggingface_hub import hf_hub_download
 
-    # If it's a local path, verify it directly
+    # This helper resolves manifests only; component validation happens after
+    # the concrete pipeline has selected its required directories.
     if os.path.exists(model_name_or_path):
-        return verify_model_config_and_directory(model_name_or_path)
+        return verify_model_config_and_directory(model_name_or_path, required_component_dirs=[])
 
-    # For remote models, download just the model_index.json
+    # For remote models, download only the small manifest. No ``local_dir``:
+    # the default path serves from (and populates) the shared HF cache, so
+    # repeat builds skip the copy and a warm cache keeps working offline.
     try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            # Download just the model_index.json file
-            model_index_path = hf_hub_download(repo_id=model_name_or_path,
-                                               filename="model_index.json",
-                                               local_dir=tmp_dir)
+        repo_id, subfolder = _split_hf_repo_subfolder(model_name_or_path)
+        from huggingface_hub.utils import EntryNotFoundError
 
-            # Load the model_index.json
-            with open(model_index_path) as f:
-                config: dict[str, Any] = json.load(f)
+        config_filename = "model_index.json"
+        try:
+            filename = f"{subfolder}/{config_filename}" if subfolder else config_filename
+            model_index_path = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
+        except EntryNotFoundError:
+            config_filename = "modular_model_index.json"
+            filename = f"{subfolder}/{config_filename}" if subfolder else config_filename
+            model_index_path = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
 
-            # Verify it has the required fields
-            if "_class_name" not in config:
-                raise ValueError(f"model_index.json for {model_name_or_path} does not contain _class_name field")
+        # Load the selected manifest.
+        with open(model_index_path) as f:
+            config: dict[str, Any] = json.load(f)
 
-            if "_diffusers_version" not in config:
-                raise ValueError(f"model_index.json for {model_name_or_path} does not contain _diffusers_version field")
+        # Verify it has the required fields
+        if "_class_name" not in config:
+            raise ValueError(f"{config_filename} for {model_name_or_path} does not contain _class_name field")
 
-            # Add the pipeline name for downstream use
-            config["pipeline_name"] = config["_class_name"]
+        if "_diffusers_version" not in config:
+            raise ValueError(f"{config_filename} for {model_name_or_path} does not contain _diffusers_version field")
 
-            logger.info("Downloaded model_index.json for %s, pipeline: %s", model_name_or_path, config["_class_name"])
-            return config
+        # Add the pipeline name for downstream use
+        config["pipeline_name"] = config["_class_name"]
+
+        logger.info("Downloaded %s for %s, pipeline: %s", config_filename, model_name_or_path, config["_class_name"])
+        return config
 
     except Exception as e:
-        raise ValueError(f"Failed to download or parse model_index.json for {model_name_or_path}: {e}") from e
+        raise ValueError(f"Failed to download or parse a Diffusers manifest for {model_name_or_path}: {e}") from e
+
+
+_HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_API_KEY")
+
+
+def resolve_hf_token() -> str | None:
+    """Return the first non-empty HF token from the standard env vars.
+
+    Order: `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `HF_API_KEY` (the last is
+    a FastVideo convention; `huggingface_hub` itself doesn't read it).
+    Does not mutate `os.environ`.
+    """
+    for src in _HF_TOKEN_ENV_VARS:
+        v = os.environ.get(src)
+        if v:
+            return v
+    return None
 
 
 def update_environment_variables(envs: dict[str, str]):

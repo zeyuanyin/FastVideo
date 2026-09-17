@@ -1,20 +1,76 @@
-The reference videos in the `*_reference_videos` directory are used as part of an e2e test to ensure consistency in video generation quality across code changes. `test_inference_similarity.py` compares newly generated videos against these references using Structural Similarity Index (SSIM) metrics to detect any regressions in visual quality across code changes.
+The reference videos are used as part of e2e SSIM regression tests.
+Wan inference coverage now lives in `test_wan_t2v_similarity.py` and
+`test_wan_i2v_similarity.py` alongside the other model-specific SSIM files.
+These tests compare newly generated videos against references to detect quality
+regressions.
 
-`A40_reference_videos` are generated on A40s and so on.
+reference layout:
+- `reference_videos/default/<GPU>_reference_videos/<model>/<backend>/...`
+- `reference_videos/full_quality/<GPU>_reference_videos/<model>/<backend>/...`
 
-run `bash update_reference_videos.sh` from inside the `fastvideo/tests/ssim/` directory after running `test_inference_similarity.py` to update reference videos. Note: make sure to update the path to the corresponding device.
+`A40_reference_videos` are generated on A40s and so on. (legacy default layout
+`<ssim_dir>/<GPU>_reference_videos/...` is still read as fallback.)
+
+Before SSIM tests run, missing reference videos are auto-downloaded from a
+public HF repo (configured by `FASTVIDEO_SSIM_REFERENCE_HF_REPO`, default:
+`FastVideo/ssim-reference-videos`).
+
+Use the CLI:
+- `python fastvideo/tests/ssim/reference_videos_cli.py --help`
+- `python fastvideo/tests/ssim/reference_videos_cli.py copy-local --help`
+- `python fastvideo/tests/ssim/reference_videos_cli.py copy-local --quality-tier default --device-folder H200_reference_videos`
+- `python fastvideo/tests/ssim/reference_videos_cli.py copy-local --quality-tier full_quality --device-folder H200_reference_videos`
+- `python fastvideo/tests/ssim/reference_videos_cli.py download --help`
+- `python fastvideo/tests/ssim/reference_videos_cli.py upload --help`
+- `python fastvideo/tests/ssim/reference_videos_cli.py download --quality-tier all`
+- `python fastvideo/tests/ssim/reference_videos_cli.py upload --quality-tier all`
+- `python fastvideo/tests/ssim/reference_videos_cli.py download --quality-tier full_quality --device-folder H200_reference_videos`
+- `python fastvideo/tests/ssim/reference_videos_cli.py upload --quality-tier full_quality --device-folder H200_reference_videos`
+
+For `upload`, the tool reads HF token from `HF_API_KEY` /
+`HUGGINGFACE_HUB_TOKEN` / `HF_TOKEN` and fails fast if none are set.
+
+run `pytest fastvideo/tests/ssim/ -vs --ssim-full-quality` to use the
+`*_FULL_QUALITY_PARAMS` configs (default run keeps the original shortened test
+configs).
+
+to override the HF reference repo at test time:
+`pytest fastvideo/tests/ssim/ -vs --ssim-reference-repo <org/repo>`
+
+to skip auto-download of missing refs:
+`pytest fastvideo/tests/ssim/ -vs --skip-ssim-reference-download`
+
+to bootstrap draft refs for a new model:
+`pytest fastvideo/tests/ssim/ -vs --ssim-bootstrap-mode`
+
+generated videos are written under:
+- default params: `generated_videos/default/<GPU>_reference_videos/<model_id>/<ATTENTION_BACKEND>/`
+- full-quality params: `generated_videos/full_quality/<GPU>_reference_videos/<model_id>/<ATTENTION_BACKEND>/`
+
+HF repo layout mirrors quality + GPU split:
+- `reference_videos/default/<GPU>_reference_videos/...`
+- `reference_videos/full_quality/<GPU>_reference_videos/...`
+
+Draft bootstrap refs are uploaded under:
+- `drafts/default/<GPU>_reference_videos/<model_id>/<ATTENTION_BACKEND>/...`
+- `drafts/full_quality/<GPU>_reference_videos/<model_id>/<ATTENTION_BACKEND>/...`
 
 reference videos were generated on commit `4aeabbc629e0edf91477e80e795e7bb1823c71cb`
 causal videos were generated on commit b318063c0a4618f1d5d99ea82ca67a06aad0d19d
 
 ## Adding a New SSIM Test
 
-SSIM CI runs in one Modal instance (`L40S:8`). The orchestrator
-(`fastvideo/tests/modal/ssim_test.py`) clones/builds/installs once, then
-schedules multiple `pytest` subprocesses by GPU demand. Logs are printed in
-deterministic order for failed tasks (file name, then model id), and
-fail-fast is enabled: if one task fails, active tasks are terminated and the
-full SSIM step fails.
+SSIM CI runs in one four-GPU Slinky Slurm lease. The orchestrator
+(`fastvideo/tests/ssim/ci_runner.py`) runs after the shared worker has cloned,
+built, and installed the exact PR SHA, then schedules multiple `pytest`
+subprocesses by GPU demand. Logs are printed in deterministic order for failed
+tasks (file name, then model id), and fail-fast is enabled: if one task fails,
+active tasks are terminated and the full SSIM step fails.
+
+Change-aware merge gates can pass repeated `--test-file <basename>` arguments,
+so a model-family PR runs only its owning SSIM files. Shared scheduler/helper
+changes, `/test ssim`, `/test full`, and the weekly `main` schedule run the
+complete discovered matrix.
 
 The orchestrator auto-discovers every `test_*.py` file here, so no CI config
 changes are needed when adding a new test. To declare how many GPUs your test
@@ -29,9 +85,36 @@ If `REQUIRED_GPUS` is omitted, the test defaults to 1 GPU.
 For files that define model maps (`*_MODEL_TO_PARAMS`), CI splits execution
 into one subprocess per model id by setting `FASTVIDEO_SSIM_MODEL_ID`.
 
+## Bootstrapping New References
+
+Normal SSIM runs are strict: missing references fail the test. For a new model
+PR, add `[new-model]` to the PR title or set `FASTVIDEO_SSIM_BOOTSTRAP_MODE=1`
+for the Buildkite job. CI then passes `--ssim-bootstrap-mode` to pytest.
+
+In bootstrap mode, a missing pixel `.mp4` or latent `.pt` reference is treated
+as an expected draft-reference case after the generated artifact has been
+written. The test uploads that generated artifact to the HF reference repo under
+`drafts/...` and marks the case `xfail`. Bootstrap mode does not weaken normal
+CI because it is opt-in only.
+
+After reviewing a draft, promote it into the canonical reference layout:
+
+```bash
+python fastvideo/tests/ssim/reference_videos_cli.py promote-draft \
+  --quality-tier default \
+  --device-folder L40S_reference_videos \
+  --model-id <model_id>
+```
+
+Use `--attention-backend <backend>` to promote one backend folder. Promotion
+refuses to overwrite existing canonical refs by default; pass `--force` only
+when intentionally replacing reviewed references.
+
 ## Generation Details
 
-2 x NVIDIA L40S GPUs
+SSIM CI schedules work across the four GPUs leased by
+`.buildkite/scripts/lanes/ssim.sh` using
+`fastvideo/tests/ssim/ci_runner.py`.
 
 ## Generation Parameters
 

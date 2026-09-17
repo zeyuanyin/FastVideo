@@ -3,14 +3,19 @@
 </div>
 
 <p align="center">
-     | <a href="https://hao-ai-lab.github.io/FastVideo"><b>Documentation</b></a> | <a href="https://hao-ai-lab.github.io/FastVideo/inference/inference_quick_start/"><b> Quick Start</b></a> | <a href="https://github.com/hao-ai-lab/FastVideo/discussions/982"  target="_blank"><b>Weekly Dev Meeting</b></a>  | 🟣💬 <a href="https://join.slack.com/t/fastvideo/shared_invite/zt-3f4lao1uq-u~Ipx6Lt4J27AlD2y~IdLQ" target="_blank"> <b>Slack</b> </a> |  🟣💬 <a href="https://github.com/hao-ai-lab/FastVideo/discussions/1097" target="_blank"> <b> WeChat </b> </a> |
+     | <a href="https://hao-ai-lab.github.io/FastVideo"><b>Documentation</b></a> | <a href="https://haoailab.com/FastVideo/cookbook/"><b>Cookbook</b></a> | <a href="https://hao-ai-lab.github.io/FastVideo/inference/inference_quick_start/"><b> Quick Start</b></a> | <a href="https://github.com/hao-ai-lab/FastVideo/discussions/982"  target="_blank"><b>Weekly Dev Meeting</b></a>  | 🟣💬 <a href="https://join.slack.com/t/fastvideo/shared_invite/zt-3f4lao1uq-u~Ipx6Lt4J27AlD2y~IdLQ" target="_blank"> <b>Slack</b> </a> |  🟣💬 <a href="https://github.com/hao-ai-lab/FastVideo/discussions/1097" target="_blank"> <b> WeChat </b> </a> |
 </p>
 
 **FastVideo is a unified post-training and real-time inference framework for accelerated video generation.**
 
 ## NEWS
-- `2026/03/17`: Release Live demo: [Into the Dreamverse: Vibe Directing in FastVideo](https://dreamverse.fastvideo.org/), check out the [Blog](https://haoailab.com/blogs/dreamverse/).
-- `2026/03/13`: Release Live demo: [Create a 5s 1080p Video in 4.5s with FastVideo on a Single GPU](https://1080p.fastvideo.org/), check out the [Blog](https://haoailab.com/blogs/fastvideo_realtime_1080p/).
+- `2026/09/15`: Release [FastH3 8-Step V2](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), an eight-forward data-free DMD2 checkpoint distilled from MiniMax-H3 with 80% Video Sparse Attention. Run it with `examples/inference/basic/basic_fasth3_8step.py` or the [FastH3 8-Step V2 recipe](https://haoailab.com/FastVideo/cookbook/minimax-h3/).
+- `2026/09/01`: FastH3 now runs locally on Apple Silicon through MLX and on NVIDIA DGX Spark through CUDA 13, including two-Spark inference. Follow the [FastH3 recipes](https://haoailab.com/FastVideo/cookbook/minimax-h3/) and read the [Blog](https://haoailab.com/blogs/fasth3-local/).
+- `2026/08/27`: [FastH3 Preview v1](https://haoailab.com/blogs/fasth3-preview/) is an open-weight 4-step sparse-distilled MiniMax-H3 model for synchronized video-and-audio generation, developed in collaboration with [Nuva Lab](https://nuvalab.ai/) and the [NVIDIA FastGen team](https://github.com/NVlabs/FastGen). Download the recommended [VSA / Data-Free weights](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), or see the [full FastH3 collection](https://huggingface.co/collections/FastVideo/fastvideo-fasth3).
+- `2026/08/19`: FastVideo now supports MLX on Apple Silicon with [FastMetal-QAD](https://huggingface.co/collections/FastVideo/fastmetal), a family of 1.3B, 5B, and 14B models optimized for Mac—follow the [Apple Silicon guide](https://hao-ai-lab.github.io/FastVideo/getting_started/installation/mps/) and read the [Blog](https://haoailab.com/blogs/fastmetal/).
+- `2026/06/23`: Release FastWan-QAD: 5s of Video generated in 1.8s E2E. See the [FastWan-QAD models](https://huggingface.co/FastVideo/FastWan-QAD-FP8-1.3B), [Attn-QAT training guide](https://haoailab.com/FastVideo/training/attn_qat/), and [blog](https://haoailab.com/blogs/fastwan-qad/).
+- `2026/03/17`: Release demo: Into the Dreamverse: Vibe Directing in FastVideo, check out the [Blog](https://haoailab.com/blogs/dreamverse/).
+- `2026/03/13`: Release demo: Create a 5s 1080p Video in 4.5s with FastVideo on a Single GPU, check out the [Blog](https://haoailab.com/blogs/fastvideo_realtime_1080p/).
 - `2025/11/19`: Release [CausalWan2.2 I2V A14B Preview](https://huggingface.co/FastVideo/CausalWan2.2-I2V-A14B-Preview-Diffusers) models, [Blog](https://hao-ai-lab.github.io/blogs/fastvideo_causalwan_preview/) and [Inference Code!](https://github.com/hao-ai-lab/FastVideo/blob/main/examples/inference/basic/basic_self_forcing_causal_wan2_2_i2v.py).
 - `2025/08/04`: Release [FastWan](https://hao-ai-lab.github.io/FastVideo/distillation/dmd) models and [Sparse-Distillation](https://hao-ai-lab.github.io/blogs/fastvideo_post_training/).
 
@@ -32,7 +37,7 @@ FastVideo has the following features:
   - [Sparse distillation](https://hao-ai-lab.github.io/blogs/fastvideo_post_training/) to achieve >50x denoising speedup
   - Scalable training with FSDP2, sequence parallelism, and selective activation checkpointing.
   - Causal distillation through Self-Forcing
-  - See this [page](https://hao-ai-lab.github.io/FastVideo/training/overview/) for full list of supported models and recipes.
+  - See this [page](https://hao-ai-lab.github.io/FastVideo/training/overview/) for the supported training workflows, and the [support matrix](https://hao-ai-lab.github.io/FastVideo/inference/support_matrix/) for supported models.
 - State-of-the-art performance optimizations for inference
   - Sequence Parallelism for distributed inference
   - Multiple state-of-the-art attention backends
@@ -42,6 +47,8 @@ FastVideo has the following features:
   - Support H100, A100, 4090
   - Support Linux, Windows, MacOS
   - See this [page](https://hao-ai-lab.github.io/FastVideo/inference/support_matrix/) for full list of supported models, hardware assumptions, and optimization compatibility.
+- Realtime video generation & editing
+  - [Dreamverse](apps/dreamverse/README.md): stream and "vibe direct" video in realtime ([live demo](https://dreamverse.fastvideo.org/)), deployable on local GPU, a self-hosted B200 server, Docker, or serverless Modal
 
 ## Getting Started
 
@@ -52,11 +59,42 @@ We recommend using [uv](https://docs.astral.sh/uv/) to create a clean environmen
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-# Install FastVideo
-uv pip install fastvideo
+# Install FastVideo on NVIDIA CUDA 12
+UV_TORCH_BACKEND=cu126 uv pip install fastvideo
 ```
 
+Use `UV_TORCH_BACKEND=cu130` on CUDA 13. Apple silicon users should follow the
+[MPS installation guide](https://hao-ai-lab.github.io/FastVideo/getting_started/installation/mps/).
+
+> **On an Apple Silicon Mac?** FastVideo runs FastMetal-QAD through an MLX
+> runtime. Install with `uv pip install -e '.[mlx]'`, download
+> [`FastVideo/FastMetal-1.3B-QAD`](https://huggingface.co/FastVideo/FastMetal-1.3B-QAD),
+> and follow the
+> [Apple Silicon guide](https://hao-ai-lab.github.io/FastVideo/getting_started/installation/mps/).
+
 Please see our [docs](https://hao-ai-lab.github.io/FastVideo/getting_started/installation/) for more detailed installation instructions.
+
+> **On an NVIDIA DGX Spark (GB10 / ARM64 + CUDA 13)?** There's no prebuilt ARM wheel for the FastVideo CUDA kernel, so it's an editable from-source install (`UV_TORCH_BACKEND=cu130 uv pip install -e .`, which compiles that kernel for you) rather than `UV_TORCH_BACKEND=cu130 uv pip install fastvideo`. A compatible prebuilt ARM64 FlashAttention wheel is available separately. Follow the [DGX Spark install guide](https://hao-ai-lab.github.io/FastVideo/getting_started/installation/spark/).
+
+### Install with an AI coding agent
+
+FastVideo is a monorepo with rich agent guidance (see [`AGENTS.md`](AGENTS.md)). If you use Claude Code, Cursor, or another coding agent, paste the prompt below — it detects your platform and follows the matching guide:
+
+```text
+Install FastVideo (https://github.com/hao-ai-lab/FastVideo) into a fresh uv virtual environment.
+
+1. Detect the platform: run `uname -m`, `nvidia-smi`, and `nvcc --version`.
+2. Read and follow the matching install guide exactly (in this repo, or at
+   https://hao-ai-lab.github.io/FastVideo/getting_started/installation/):
+     - NVIDIA GPU, x86_64                         -> docs/getting_started/installation/gpu.md
+     - NVIDIA DGX Spark / GB10, aarch64, CUDA 13  -> docs/getting_started/installation/spark.md
+     - Apple Silicon, macOS                       -> docs/getting_started/installation/mps.md
+3. Use uv for every step. If a command fails, debug it and tell me what you changed.
+4. Verify the result:
+     python -c "import fastvideo, torch; print('cuda', torch.cuda.is_available())"
+     fastvideo --help
+5. Report which platform you detected and any deviations you had to make.
+```
 
 ## Sparse Distillation
 
@@ -68,6 +106,19 @@ See below for recipes and datasets:
 | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | [FastWan2.1-T2V-1.3B](https://huggingface.co/FastVideo/FastWan2.1-T2V-1.3B-Diffusers) | [Recipe](https://github.com/hao-ai-lab/FastVideo/tree/main/examples/distill/Wan2.1-T2V/Wan-Syn-Data-480P)       | [FastVideo Synthetic Wan2.1 480P](https://huggingface.co/datasets/FastVideo/Wan-Syn_77x448x832_600k)     |
 | [FastWan2.2-TI2V-5B](https://huggingface.co/FastVideo/FastWan2.2-TI2V-5B-Diffusers)   | [Recipe](https://github.com/hao-ai-lab/FastVideo/tree/main/examples/distill/Wan2.2-TI2V-5B-Diffusers/Data-free) | [FastVideo Synthetic Wan2.2 720P](https://huggingface.co/datasets/FastVideo/Wan2.2-Syn-121x704x1280_32k) |
+
+## Dreamverse — Realtime Video Generation & Editing
+
+[Dreamverse](apps/dreamverse/README.md) is FastVideo's realtime video generation
+and editing platform — "vibe directing" a video as it streams. It lives in the
+monorepo under [`apps/dreamverse/`](apps/dreamverse/) and ships its own backend
+(`dreamverse-server`) plus a web UI.
+
+Try the [live demo](https://dreamverse.fastvideo.org/), read the
+[blog](https://haoailab.com/blogs/dreamverse/), or run it yourself. Dreamverse
+deploys on a local GPU, a self-hosted B200 server over SSH, Docker, or
+serverless [Modal](apps/dreamverse/scripts/modal/README.md) — see the
+[Dreamverse README](apps/dreamverse/README.md).
 
 ## Inference
 

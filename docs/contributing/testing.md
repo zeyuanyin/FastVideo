@@ -1,131 +1,282 @@
-# Testing in FastVideo
+# Testing In FastVideo
 
-This guide explains how to add and run tests in FastVideo. The testing suite is divided into several categories to ensure correctness across components, training workflows, and inference quality.
+This guide explains how to add and run tests in FastVideo. CI routing,
+slash-command mappings, and workflow ownership live in
+[CI/CD Architecture](ci_architecture.md).
 
 ## Test Types
 
-* **Unit Tests**: Located in `fastvideo/tests/dataset`, `fastvideo/tests/entrypoints`, and `fastvideo/tests/workflow`. These test individual functions and classes.
-* **Component Tests**: Located in `fastvideo/tests/encoders`, `fastvideo/tests/transformers`, and `fastvideo/tests/vaes`. These verify the loading and basic functionality of model components.
-* **SSIM Tests**: Located in `fastvideo/tests/ssim`. These are regression tests that compare generated videos against reference videos using the Structural Similarity Index Measure (SSIM) to detect quality degradation.
-* **Training Tests**: Located in `fastvideo/tests/training`. These validate training loops, loss calculations, and specific training techniques like LoRA, Distillation, and VSA.
-* **Inference Tests**: Located in `fastvideo/tests/inference`. These test specialized inference pipelines and optimizations (e.g., VSA, V-MoBA).
+| Type | Location | Purpose |
+|---|---|---|
+| Unit tests | `fastvideo/tests/api`, `fastvideo/tests/dataset`, `fastvideo/tests/entrypoints`, `fastvideo/tests/workflow`, CPU-safe `fastvideo/tests/train` subsets | Validate individual functions, APIs, contracts, and lightweight workflows. |
+| Component tests | `fastvideo/tests/encoders`, `fastvideo/tests/transformers`, `fastvideo/tests/vaes` | Validate loading and basic behavior for model components. |
+| Golden gates | `fastvideo/tests/golden_gate` | Compare small, deterministic component outputs exactly against device/runtime-matched reference tensors. |
+| Train framework tests | `fastvideo/tests/train/models`, `fastvideo/tests/train/methods` | Exercise the new `fastvideo/train/` framework on real checkpoints and tiny synthetic batches. |
+| SSIM tests | `fastvideo/tests/ssim` | Compare generated videos against references to catch visual regressions. |
+| Training tests | `fastvideo/tests/training` | Validate legacy training loops, LoRA, distillation, self-forcing, and VSA behavior. |
+| Inference tests | `fastvideo/tests/inference` | Validate specialized inference paths such as LoRA inference and V-MoBA. |
+| Performance tests | `fastvideo/tests/performance` | Gate latency, throughput, peak memory, and stage timings. See [Performance Benchmarks](performance_benchmarks.md). |
+| Eval tests | `fastvideo/tests/eval` | Check eval metrics against pinned reference scores and assets. |
+| DreamVerse app tests | `apps/dreamverse` | Validate the DreamVerse backend, frontend, and mock-backed browser flows. |
 
-For now, we will focus on **SSIM Tests**.
+## Running Tests Locally
+
+Start with the cheapest checks that cover the changed behavior, and stop on a
+failure before starting heavier dependent checks:
+
+1. Run pre-commit on changed files and focused import, config, and contract tests.
+2. Run the smallest matching component golden gate. Prefer one GPU, tiny fixed
+   inputs, cached component weights, and direct tensor comparisons over renders.
+3. Run focused component parity or default SSIM when the golden does not cover
+   the changed behavior, such as VAE normalization or pipeline wiring.
+4. Run full-quality renders or broad suites when required by the change, an
+   explicit request, or CI policy, rather than on every edit.
+
+A golden must cover the component being changed. Wan has four small gates:
+
+| Gate | Boundary |
+|---|---|
+| `test_wan_t2v.py` | Dense transformer block 0 |
+| `test_wan_vae.py` | FP32 encode, BF16 decode, streaming, and cache reset |
+| `test_wan_causal.py` | Real block weights, cache append/rewrite, and sink eviction |
+| `test_wan_denoising.py` | Three real 1.3B DiT/UniPC steps with fixed prompt embeddings |
+
+These use an immutable Wan checkpoint revision and only download the required
+component. The trajectory gate needs no tokenizer, text encoder, VAE, or video
+reference. Weight-free stage tests also exercise every step of a 50-step UniPC
+loop, CFG caching, expert switching, conditioning layouts, and DMD RNG order.
+These checks do not replace independent Diffusers parity or end-to-end SSIM.
+
+Use the golden's matching GPU, dtype, backend, and runtime. A missing reference
+or environment mismatch is not a pass. Do not replace a reference with the
+candidate output just to clear a failure. For a relocation, the unchanged
+parent is the baseline; two imports of the same class are not numerical proof.
+
+The VAE and transformer CI lanes run their Wan component goldens first.
+Selected integration lanes wait for the golden lane in merge/full builds.
+See [CI/CD Architecture](ci_architecture.md) for direct-rerun and skip semantics.
+
+For Wan, one command enforces the local ordering and stops on failure:
+
+The initial contracts include `tests/api/test_wan_definitions.py`: all registered
+Wan aliases, local-manifest detector precedence, sampling/precision defaults,
+config isolation, and legacy serialized-config compatibility. These require no
+weights or Hub access; the current package import still needs its prepared
+runtime environment.
+
+```bash
+bash scripts/validate_wan.sh vae           # contracts, then the VAE golden
+bash scripts/validate_wan.sh dense parity  # contracts, goldens, Diffusers parity
+bash scripts/validate_wan.sh all default   # then focused T2V/I2V/causal SSIM
+```
+
+The second argument is an upper validation tier, not a reference override.
+Supply the GPU/backend/runtime and SSIM model/tier settings that match the
+reference. The script never updates references. Causal component coverage is
+a block-cache fingerprint, not independent full causal-pipeline parity.
+
+New named-tensor gates write a missing output to `*.candidate.pt` and fail;
+running candidate code again cannot turn it into an approved reference. Seed
+from unchanged, pushed source, verify two independent processes bit-for-bit,
+then review and publish only the new reference files. Preserve the baseline
+source SHA, test recipe SHA, checkpoint revision, runtime, and comparison
+receipt with the run artifacts. Never overwrite an existing video reference
+as a side effect of adding a tensor gate.
+
+Examples of focused checks:
+
+```bash
+pytest fastvideo/tests/loader/test_wan_family_imports.py -q
+pytest fastvideo/tests/golden_gate/test_wan_t2v.py -q
+pytest fastvideo/tests/vaes/test_wan_vae.py -q
+```
+
+GPU-heavy suites need the right hardware, credentials, local caches, and
+sometimes custom kernels. Document those assumptions in new tests.
 
 ## SSIM Tests
 
-SSIM tests are located in `fastvideo/tests/ssim`. These tests generate videos using specific models and parameters, and compare them against reference videos to ensure that changes in the codebase do not degrade generation quality or alter the output unexpectedly.
+SSIM tests generate videos using specific models and parameters, then compare
+the output against reference videos with Structural Similarity Index Measure.
+Use them for pipeline-level visual regression coverage when output quality or
+generation behavior must be preserved.
 
 !!! note
-    If you are adding an SSIM test, this serves as a safeguard. Any future code changes that break or cause errors with the specific arguments and configurations you defined will trigger a failure. Therefore, it is important to include multiple settings and arguments that cover the core features of your new pipeline to ensure robust regression testing.
+    Add enough prompts, seeds, backends, and parameter combinations to cover the
+    behavior you want to protect, but keep runtime reasonable for CI.
 
 ### Directory Structure
 
-```
+```text
 fastvideo/tests/ssim/
-├── <GPU>_reference_videos/   # Reference videos organized by GPU type (e.g., L40S_reference_videos)
-│   ├── <Model_Name>/
-│   │   ├── <Backend>/        # e.g., FLASH_ATTN, TORCH_SDPA
-│   │   │   └── <Video_File>
-├── test_causal_similarity.py
-├── test_inference_similarity.py
-├── update_reference_videos.sh
+├── reference_videos/
+│   ├── default/
+│   │   └── <GPU>_reference_videos/
+│   │       └── <Model_Name>/
+│   │           └── <Backend>/
+│   │               └── <Video_File>
+│   └── full_quality/
+│       └── <GPU>_reference_videos/
+├── generated_videos/
+├── reference_videos_cli.py
+├── test_wan_t2v_similarity.py
+├── test_wan_i2v_similarity.py
 └── ...
 ```
 
-### Adding a New SSIM Test
+### Adding An SSIM Test
 
-To add a new SSIM test, follow these steps:
+1. Create or update a model-specific file, for example
+   `test_wan_t2v_similarity.py`.
+2. Define model parameters such as model path, dimensions, frame count,
+   inference steps, guidance, seed, and GPU count.
+3. Parametrize prompts, attention backends, and model variants where useful.
+4. Generate the video with `VideoGenerator`.
+5. Compare the generated video with the reference using the SSIM helpers.
+6. Seed or update reference videos only after inspecting output quality.
 
-1. **Create or Update a Test File**: You can add a new test function to an existing file (like `test_inference_similarity.py`) or create a new one if testing a distinct category of models.
+Example shape:
 
-2. **Define Model Parameters**: Define the configuration for the model you want to test. This includes model path, dimensions, inference steps, and other generation parameters. **Note:** Consider using lower `num_inference_steps` or reduced resolution (e.g., 480p instead of 720p) to keep test execution time reasonable, provided it doesn't compromise the test's ability to detect regression.
+```python
+import pytest
 
-   ```python
-   MY_MODEL_PARAMS = {
-       "num_gpus": 1,
-       "model_path": "organization/model-name",
-       "height": 480,
-       "width": 832,
-       "num_frames": 45,
-       "num_inference_steps": 20,
-       # ... other parameters
-   }
-   ```
 
-3. **Implement the Test Function**:
-   * Use `pytest.mark.parametrize` to run the test with different prompts, backends, and models.
-   * Set the attention backend environment variable.
-   * Initialize the `VideoGenerator`.
-   * Generate the video.
-   * Compare the generated video with the reference video using `compute_video_ssim_torchvision`.
+MY_MODEL_PARAMS = {
+    "num_gpus": 1,
+    "model_path": "organization/model-name",
+    "height": 480,
+    "width": 832,
+    "num_frames": 45,
+    "num_inference_steps": 20,
+}
 
-   Example structure:
 
-   ```python
-   @pytest.mark.parametrize("prompt", TEST_PROMPTS)
-   @pytest.mark.parametrize("ATTENTION_BACKEND", ["FLASH_ATTN"])
-   def test_my_model_similarity(prompt, ATTENTION_BACKEND):
-       # Setup output directories
-       # ...
+@pytest.mark.parametrize("prompt", TEST_PROMPTS)
+@pytest.mark.parametrize("attention_backend", ["FLASH_ATTN"])
+def test_my_model_similarity(prompt, attention_backend):
+    # Set backend, generate video, and compare against reference.
+    ssim_values = compute_video_ssim_torchvision(
+        reference_path,
+        generated_path,
+        use_ms_ssim=True,
+    )
+    assert ssim_values[0] >= 0.98
+```
 
-       # Initialize Generator
-       generator = VideoGenerator.from_pretrained(...)
-       generator.generate_video(prompt, ...)
+### Reference Videos
 
-       # Compare with Reference
-       ssim_values = compute_video_ssim_torchvision(
-           reference_path, generated_path, use_ms_ssim=True
-       )
-       assert ssim_values[0] >= 0.98  # Threshold
-   ```
+When a reference is missing, the test writes generated output under:
 
-4. **Reference Videos**:
-   * When running the test for the first time (or when updating the reference), the test will fail because the reference video is missing. The generated video will be saved in `fastvideo/tests/ssim/generated_videos`.
-   * Inspect the generated video to ensure it meets quality expectations.
-   * Move the generated video to the appropriate reference folder: `fastvideo/tests/ssim/<GPU>_reference_videos/<Model>/<Backend>/`.
-   * You can use the helper script `update_reference_videos.sh` to automate copying videos from `generated_videos` to `L40S_reference_videos`. Note: Check the script to ensure paths match your environment (it defaults to `L40S_reference_videos`).
+```text
+fastvideo/tests/ssim/generated_videos/<quality-tier>/<GPU>_reference_videos
+```
 
-### Running Tests Locally
+After inspecting the generated video, copy it into the matching reference tree:
 
-To run the SSIM tests locally:
+```text
+fastvideo/tests/ssim/reference_videos/<quality-tier>/<GPU>_reference_videos/<Model>/<Backend>/
+```
+
+The helper CLI can copy, upload, and download references:
+
+```bash
+python fastvideo/tests/ssim/reference_videos_cli.py copy-local \
+  --quality-tier default \
+  --reference-dir fastvideo/tests/ssim/reference_videos/default/L40S_reference_videos
+
+python fastvideo/tests/ssim/reference_videos_cli.py upload --quality-tier all
+
+python fastvideo/tests/ssim/reference_videos_cli.py download \
+  --quality-tier full_quality \
+  --device-folder H200_reference_videos
+```
+
+### Running SSIM Locally
 
 ```bash
 pytest fastvideo/tests/ssim/ -vs
 ```
 
-Ensure you have the necessary GPUs available as defined in your test parameters.
+Use a machine whose GPU and backend match the reference folder you are testing.
 
-## Modal Workflow
+## Slurm CI Runs For SSIM
 
-FastVideo uses [Modal](https://modal.com/) for running tests in a CI environment. The workflow scripts are located in `fastvideo/tests/modal/`.
+Comment `/test ssim` on a pull request to run the canonical four-GPU SSIM
+lane on the Slinky Slurm cluster. `fastvideo/tests/ssim/ci_runner.py`
+discovers the suite without importing test modules, packs independent pytest
+processes across the four assigned GPUs, and stops the lane on the first
+failure.
 
-### `pr_test.py`
+The change-aware `/merge` planner may run only the SSIM test basenames owned
+by the changed model family. Shared SSIM harness changes still select the
+complete lane. Independently, `main` runs the full SSIM matrix every Sunday at
+05:00 UTC so infrequently touched model families retain periodic coverage.
 
-The main entry point for CI tests is `fastvideo/tests/modal/pr_test.py`. This script defines Modal functions that execute the pytest suites on specific hardware (e.g., L40S, H100).
+For a focused developer run, invoke pytest directly and optionally select one
+model from a parameterized test through `FASTVIDEO_SSIM_MODEL_ID`:
 
-### Updating Modal Configuration
+```bash
+pytest fastvideo/tests/ssim/test_wan_t2v_similarity.py -vs
 
-If you add a new test that requires:
-* **Different GPU Hardware**: You may need to change the `@app.function(gpu=...)` decorator.
-* **Longer Execution Time**: Increase the `timeout` parameter.
-* **New Environment Variables/Secrets**: Add them to `secrets=[...]` or the image environment. For example, if your model is gated on Hugging Face, ensure `HF_API_KEY` is passed.
-
-For SSIM tests, the `run_ssim_tests` function in `pr_test.py` currently runs:
-
-```python
-@app.function(gpu="L40S:2", image=image, timeout=2700, secrets=[modal.Secret.from_dict({"HF_API_KEY": os.environ.get("HF_API_KEY", "")})])
-def run_ssim_tests():
-    run_test("hf auth login --token $HF_API_KEY && pytest ./fastvideo/tests/ssim -vs")
+FASTVIDEO_SSIM_MODEL_ID=Wan2.1-T2V-1.3B-Diffusers \
+pytest fastvideo/tests/ssim/test_wan_t2v_similarity.py -vs
 ```
 
-If your new test file is inside `fastvideo/tests/ssim`, it will automatically be picked up by this command. However, ensure that the `gpu="L40S:2"` configuration is sufficient for your model. If your model requires more GPUs (e.g., 4 or 8), you might need to create a separate Modal function or update the existing one.
+The files under `fastvideo/tests/modal/` are retained only as a disabled
+manual rollback implementation. No active CI trigger invokes them.
 
-### Workflow Scripts
+### SSIM Bootstrap Mode
 
-The shell script that triggers these tests in the CI pipeline is located at `.buildkite/scripts/pr_test.sh`. If you add a new test category (e.g., a new folder outside of `ssim`), you will need to:
-1. Add a new function in `fastvideo/tests/modal/pr_test.py`.
-2. Add a new case in `.buildkite/scripts/pr_test.sh` to handle the new test type.
+Normal SSIM runs are strict: if a reference video or latent is missing, the
+test fails. For new-model PRs, CI can run SSIM in bootstrap mode so missing
+references are uploaded as draft artifacts for review instead of immediately
+blocking on a missing canonical reference.
 
-!!! note
-    If you are a maintainer, you'll need to finally manually update the workflow script in Buildkite. Otherwise, a maintainer will help you update.
+Buildkite enables SSIM bootstrap mode when either condition is true:
+
+- the PR title or Buildkite message contains `[new-model]`;
+- `FASTVIDEO_SSIM_BOOTSTRAP_MODE=1` is set for the Buildkite job.
+
+Bootstrap mode passes `--ssim-bootstrap-mode` to pytest. When a generated
+artifact is available, the test uploads it under the `drafts/...` namespace in
+the SSIM reference repo and marks that case as expected-failed. After reviewing
+the draft, promote it into the canonical reference layout:
+
+```bash
+python fastvideo/tests/ssim/reference_videos_cli.py promote-draft \
+  --quality-tier default \
+  --device-folder L40S_reference_videos \
+  --model-id <model_id>
+```
+
+## CI Integration
+
+FastVideo GPU CI is orchestrated by Buildkite and runs only on isolated Slinky
+Slurm workers. The main files are:
+
+| File | Purpose |
+|---|---|
+| `.buildkite/pipeline.yml` | Static, validated 20-lane Slurm test graph. |
+| `.github/scripts/plan_merge_ci.py` | Trusted path-to-lane and focused quality-test policy for `/merge`. |
+| `.buildkite/scripts/unit_test.sh`, `.buildkite/scripts/lanes/*.sh` | Repository-owned test payloads executed inside Slurm containers. |
+| `fastvideo/tests/ssim/ci_runner.py` | Four-GPU SSIM task discovery and scheduling. |
+| `.buildkite/scripts/pr_test.sh`, `fastvideo/tests/modal/*.py` | Dormant manual rollback path; rejected in Buildkite. |
+
+For exact tier membership, slash commands, runner isolation, and aggregate statuses,
+see [CI/CD Architecture](ci_architecture.md).
+
+### Adding A New CI Test Category
+
+If a new test does not fit an existing lane:
+
+1. Put the test payload in an executable `.buildkite/scripts/lanes/<lane>.sh`.
+2. Add its static step to `.buildkite/pipeline.yml`, its changed-path ownership
+   to `.github/scripts/plan_merge_ci.py`, and extend the CI contract tests.
+3. Add the `/test` mapping in `.github/workflows/ci-slash-commands.yml`.
+4. Coordinate the matching GPU, timeout, dependency, secret, and artifact
+   policy in the private Slurm runner allowlist.
+5. Document the new category in [CI/CD Architecture](ci_architecture.md) and add
+   authoring notes here if contributors need them.
+
+When a test only extends an existing category, update that category's tests
+instead of adding a new CI lane.

@@ -1,14 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/attention/backends/abstract.py
 
+import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 if TYPE_CHECKING:
     pass
 
 import torch
+
+_LAYER_IDX_RE = re.compile(r"blocks\.(\d+)")
+
+
+def layer_idx_from_prefix(prefix: str, default: int | None = None) -> int:
+    """Parse the transformer-block index out of a layer prefix.
+
+    Shared by backends that key per-layer behavior off the block number
+    (vmoba, VSA-H3). Raises when unparsable unless ``default`` is given.
+    """
+    match = _LAYER_IDX_RE.search(prefix)
+    if match:
+        return int(match.group(1))
+    if default is None:
+        raise ValueError(f"cannot parse a layer index from attention prefix {prefix!r}")
+    return default
 
 
 class AttentionBackend(ABC):
@@ -53,6 +70,10 @@ class AttentionMetadata:
     """Attention metadata for prefill and decode batched together."""
     # Current step of diffusion process
     current_timestep: int
+    VSA_sparsity: float = field(default=0.0, kw_only=True)
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def asdict_zerocopy(self, skip_fields: set[str] | None = None) -> dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
@@ -82,7 +103,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     @abstractmethod
     def build(
         self,
-        **kwargs: dict[str, Any],
+        **kwargs: Any,
     ) -> AttentionMetadata:
         """Build attention metadata with on-device tensors."""
         raise NotImplementedError

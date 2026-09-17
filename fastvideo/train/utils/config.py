@@ -24,6 +24,8 @@ from fastvideo.train.utils.training_config import (
 
 logger = init_logger(__name__)
 
+_TRAINING_DIT_ARCH_OVERRIDE_KEYS = ("local_attn_size", "sink_size")
+
 
 @dataclass(slots=True)
 class RunConfig:
@@ -260,6 +262,8 @@ def _parse_pipeline_config(
     if pipeline_raw is None:
         return None
 
+    pipeline_raw, dit_arch_overrides = _split_training_dit_arch_overrides(pipeline_raw)
+
     # Derive model_path from models.student.init_from —
     # needed by PipelineConfig.from_kwargs.
     model_path: str | None = None
@@ -276,7 +280,57 @@ def _parse_pipeline_config(
     if isinstance(pipeline_raw, str):
         kwargs["pipeline_config"] = _resolve_existing_file(pipeline_raw)
 
-    return PipelineConfig.from_kwargs(kwargs)
+    pipeline_config = PipelineConfig.from_kwargs(kwargs)
+    _apply_training_dit_arch_overrides(pipeline_config, dit_arch_overrides)
+    _resolve_dit_quant_config(pipeline_config)
+    return pipeline_config
+
+
+def _resolve_dit_quant_config(pipeline_config: Any) -> None:
+    """Resolve a string ``pipeline.dit_config.quant_config`` (e.g.
+    ``nvfp4_qat_train``) into its registered QuantizationConfig instance.
+
+    Model construction calls ``quant_config.get_quant_method()`` inside
+    ``LinearBase.__init__``, so a bare YAML string would crash there.
+    This must live in ``_parse_pipeline_config`` (not ``load_run_config``)
+    because ``dcp_to_diffusers`` rebuilds models from a checkpoint's raw
+    config by calling ``_parse_pipeline_config`` directly.
+    """
+    dit_config = getattr(pipeline_config, "dit_config", None)
+    quant = getattr(dit_config, "quant_config", None)
+    if isinstance(quant, str):
+        from fastvideo.layers.quantization import (
+            get_quantization_config, )
+        dit_config.quant_config = get_quantization_config(quant)()
+
+
+def _split_training_dit_arch_overrides(pipeline_raw: Any) -> tuple[Any, dict[str, Any]]:
+    """Remove train-only DiT arch overrides before generic config parsing."""
+    if not isinstance(pipeline_raw, dict) or not isinstance(pipeline_raw.get("dit_config"), dict):
+        return pipeline_raw, {}
+
+    dit_raw = pipeline_raw["dit_config"]
+    overrides = {key: dit_raw[key] for key in _TRAINING_DIT_ARCH_OVERRIDE_KEYS if key in dit_raw}
+    if not overrides:
+        return pipeline_raw, {}
+
+    pipeline_raw = dict(pipeline_raw)
+    pipeline_raw["dit_config"] = {key: value for key, value in dit_raw.items() if key not in overrides}
+    return pipeline_raw, overrides
+
+
+def _apply_training_dit_arch_overrides(pipeline_config: Any, overrides: dict[str, Any]) -> None:
+    """Apply train-only DiT arch overrides after PipelineConfig construction."""
+    if not overrides:
+        return
+
+    arch_config = pipeline_config.dit_config.arch_config
+    for key, value in overrides.items():
+        if not hasattr(arch_config, key):
+            raise ValueError(f"pipeline.dit_config.{key} is not a valid field for {type(arch_config).__name__}")
+        setattr(arch_config, key, value)
+    if hasattr(arch_config, "__post_init__"):
+        arch_config.__post_init__()
 
 
 def _build_training_config(
@@ -285,7 +339,12 @@ def _build_training_config(
     models: dict[str, dict[str, Any]],
     pipeline_config: Any,
 ) -> TrainingConfig:
-    """Build TrainingConfig from nested training: YAML."""
+    """Build ``TrainingConfig`` from the nested ``training`` YAML mapping.
+
+    ``preprocessed_data_type`` selects the dataloader's tensor contract:
+    ``t2v`` carries video and text, ``t2va`` carries synchronized video,
+    audio, and text, and ``text_only`` carries prompt conditioning.
+    """
     d = dict(t.get("distributed", {}) or {})
     da = dict(t.get("data", {}) or {})
     o = dict(t.get("optimizer", {}) or {})
@@ -308,6 +367,21 @@ def _build_training_config(
             if init_from is not None:
                 model_path = str(init_from)
 
+    raw_data_path = da.get("data_path", "") or ""
+    data_path: str | list[str] | dict[str, int]
+    if isinstance(raw_data_path, dict):
+        data_path = {str(path): int(repeat) for path, repeat in raw_data_path.items()}
+    elif isinstance(raw_data_path, list | tuple):
+        data_path = [str(path) for path in raw_data_path]
+    else:
+        data_path = str(raw_data_path)
+
+    preprocessed_data_type = str(da.get("preprocessed_data_type", "t2v") or "t2v").strip().lower()
+    if preprocessed_data_type not in {"t2v", "t2va", "text_only"}:
+        raise ValueError("training.data.preprocessed_data_type must be one of "
+                         "{'t2v', 't2va', 'text_only'}, got "
+                         f"{preprocessed_data_type!r}")
+
     return TrainingConfig(
         distributed=DistributedConfig(
             num_gpus=num_gpus,
@@ -318,7 +392,8 @@ def _build_training_config(
             pin_cpu_memory=bool(d.get("pin_cpu_memory", False)),
         ),
         data=DataConfig(
-            data_path=str(da.get("data_path", "") or ""),
+            data_path=data_path,
+            preprocessed_data_type=preprocessed_data_type,
             train_batch_size=int(da.get("train_batch_size", 1) or 1),
             dataloader_num_workers=int(da.get("dataloader_num_workers", 0) or 0),
             training_cfg_rate=float(da.get("training_cfg_rate", 0.0) or 0.0),
@@ -350,10 +425,12 @@ def _build_training_config(
         ),
         tracker=TrackerConfig(
             trackers=list(tr.get("trackers", []) or []),
+            entity=str(tr.get("entity", "") or ""),
             project_name=str(tr.get("project_name", "fastvideo") or "fastvideo"),
             run_name=str(tr.get("run_name", "") or ""),
         ),
         vsa_sparsity=float(vs.get("sparsity", 0.0) or 0.0),
+        vsa_cache_tile_buf=bool(vs.get("cache_tile_buf", False) or False),
         model=ModelTrainingConfig(
             weighting_scheme=str(m.get("weighting_scheme", "uniform") or "uniform"),
             logit_mean=float(m.get("logit_mean", 0.0) or 0.0),

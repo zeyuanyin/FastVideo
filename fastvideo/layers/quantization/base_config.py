@@ -61,7 +61,7 @@ def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: dict[str, list[str]] = dict()
@@ -138,6 +138,15 @@ class QuantizationConfig(ABC):
             method.
         """
         raise NotImplementedError
+
+    def validate_runtime(self, device: torch.device) -> None:
+        """Fail fast on a device the scheme cannot execute on.
+
+        Called once by loaders that select a serialized checkpoint scheme,
+        before any weight is read. The default accepts every device; schemes
+        with kernel or capability requirements override it.
+        """
+        return None
 
     def get_cache_scale(self, name: str) -> str | None:
         return None

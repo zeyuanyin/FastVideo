@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING, TypeAlias
 
 import torch
 
+from fastvideo.attention.selector import coerce_attn_backend
 from fastvideo.distributed import get_local_torch_device
 from fastvideo.models.utils import pred_noise_to_pred_video
+from fastvideo.platforms import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from fastvideo.train.utils.training_config import (
         TrainingConfig, )
+    from fastvideo.train.utils.lora import LoraConfig
     from fastvideo.pipelines import TrainingBatch
+
+# Video models return one flow tensor. Joint video/audio models return an
+# ordered pair so training methods can apply each modality's scheduler target.
+NoisePrediction: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
 class ModelBase(ABC):
@@ -30,10 +37,57 @@ class ModelBase(ABC):
     noise_scheduler: Any
     _trainable: bool
 
+    def __init__(
+        self,
+        *,
+        trainable: bool = True,
+        lora: LoraConfig | dict[str, Any] | None = None,
+        attention_backend: AttentionBackendEnum | str | None = None,
+    ) -> None:
+        from fastvideo.train.utils.lora import LoraConfig
+
+        self._trainable = bool(trainable)
+        self._lora_config: LoraConfig | None = LoraConfig.coerce(lora)
+        self._num_lora_layers = 0
+        self.attention_backend = coerce_attn_backend(attention_backend)
+
+    @property
+    def attention_backend_name(self) -> str | None:
+        """Explicit per-role backend name, or ``None`` for global/default."""
+        if self.attention_backend is None:
+            return None
+        return self.attention_backend.name
+
     @property
     def device(self) -> torch.device:
         """The local CUDA device for this rank."""
         return get_local_torch_device()
+
+    def _enable_lora_if_configured(
+        self,
+        transformer: torch.nn.Module,
+    ) -> bool:
+        """Enable LoRA training for model plugins that request it.
+
+        Concrete models still own transformer loading because class names and
+        checkpoint setup are model-specific. The LoRA activation path is shared.
+        """
+        cfg = self._lora_config
+        if cfg is None or not cfg.enable:
+            return False
+        if not self._trainable:
+            raise ValueError("LoRA training requires trainable=true for the role model")
+
+        from fastvideo.train.utils.lora import enable_lora_training
+
+        assert cfg.rank is not None  # guaranteed by LoraConfig validation
+        self._num_lora_layers = enable_lora_training(
+            transformer,
+            lora_rank=cfg.rank,
+            lora_alpha=cfg.alpha,
+            lora_target_modules=cfg.target_modules,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -51,6 +105,17 @@ class ModelBase(ABC):
 
     def on_train_start(self) -> None:  # noqa: B027
         """Called once before the training loop begins."""
+
+    def decode_latents(
+        self,
+        latents_b_t_c_h_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode ``[B, T, C, H, W]`` latents to ``[B, C, T, H, W]`` media.
+
+        RL reward methods call this hook instead of reaching into
+        model-specific VAE normalization details.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement decode_latents()")
 
     # ------------------------------------------------------------------
     # Timestep helpers
@@ -98,8 +163,8 @@ class ModelBase(ABC):
         conditional: bool,
         cfg_uncond: dict[str, Any] | None = None,
         attn_kind: Literal["dense", "vsa"] = "dense",
-    ) -> torch.Tensor:
-        """Predict noise/flow for the given noisy latents."""
+    ) -> NoisePrediction:
+        """Predict video flow or an ordered ``(video, audio)`` flow pair."""
 
     def predict_x0(
         self,
@@ -111,7 +176,12 @@ class ModelBase(ABC):
         cfg_uncond: dict[str, Any] | None = None,
         attn_kind: Literal["dense", "vsa"] = "dense",
     ) -> torch.Tensor:
-        """Predict x0 via ``predict_noise`` + conversion."""
+        """Convert a video-only flow prediction to clean video latents.
+
+        This helper owns one noisy video tensor and one video scheduler. Joint
+        video/audio callers apply their modality-specific conversions where
+        both noisy tensors and both schedulers are available.
+        """
         pred_noise = self.predict_noise(
             noisy_latents,
             timestep,
@@ -120,6 +190,8 @@ class ModelBase(ABC):
             cfg_uncond=cfg_uncond,
             attn_kind=attn_kind,
         )
+        if isinstance(pred_noise, tuple):
+            raise TypeError("predict_x0 requires one video prediction tensor")
         return pred_noise_to_pred_video(
             pred_noise=pred_noise.flatten(0, 1),
             noise_input_latent=noisy_latents.flatten(0, 1),

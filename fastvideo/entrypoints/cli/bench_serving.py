@@ -7,7 +7,7 @@ Example usage:
     # launch a server and benchmark on it
 
     # T2V or T2I or any other multimodal generation model
-    fastvideo serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --port 8000
+    fastvideo serve --config serve.yaml
 
     # benchmark it and make sure the port is the same as the server's port
     fastvideo bench --dataset vbench --num-prompts 20 --port 8000
@@ -626,7 +626,9 @@ async def benchmark(args: argparse.Namespace) -> None:
         ) as resp:
             if resp.status == 200:
                 info = await resp.json()
-                if "model_path" in info and info["model_path"]:
+                if info.get("served_model_name"):
+                    args.model = info["served_model_name"]
+                elif info.get("model_path"):
                     args.model = info["model_path"]
                     logger.info("Updated model name from server: %s", args.model)
     except Exception as e:

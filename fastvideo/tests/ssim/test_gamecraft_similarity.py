@@ -6,7 +6,8 @@ Generates a video with deterministic seed and camera trajectory,
 then compares against a device-specific reference video via MS-SSIM.
 
 Reference videos must be pre-generated and stored under:
-    <device>_reference_videos/HunyuanGameCraft/<ATTENTION_BACKEND>/
+    reference_videos/<quality-tier>/<device>_reference_videos/HunyuanGameCraft/
+    <ATTENTION_BACKEND>/
 
 To create initial reference videos, run this test once and copy the
 generated videos into the appropriate reference folder.
@@ -17,7 +18,15 @@ import torch
 import pytest
 
 from fastvideo import VideoGenerator
+from fastvideo.api.sampling_param import SamplingParam
 from fastvideo.logger import init_logger
+from fastvideo.tests.ssim.reference_utils import (
+    build_generated_output_dir,
+    build_reference_folder_path,
+    get_cuda_device_name,
+    resolve_device_reference_folder,
+    select_ssim_params,
+)
 from fastvideo.tests.utils import (
     compute_video_ssim_torchvision,
     write_ssim_results,
@@ -27,24 +36,24 @@ from fastvideo.worker.multiproc_executor import MultiprocExecutor
 logger = init_logger(__name__)
 
 REQUIRED_GPUS = 1
+pytestmark = pytest.mark.skip(reason="Disabled pending removal of HunyuanGameCraft support.")
 
 # ---------------------------------------------------------------------------
 # Device-dependent reference folder
 # ---------------------------------------------------------------------------
-device_name = torch.cuda.get_device_name()
-device_reference_folder_suffix = "_reference_videos"
-
-if "A40" in device_name:
-    device_reference_folder = "A40" + device_reference_folder_suffix
-elif "L40S" in device_name:
-    device_reference_folder = "L40S" + device_reference_folder_suffix
-elif "A100" in device_name:
-    device_reference_folder = "A100" + device_reference_folder_suffix
-elif "H100" in device_name:
-    device_reference_folder = "H100" + device_reference_folder_suffix
-else:
-    device_reference_folder = "Unknown" + device_reference_folder_suffix
-    logger.warning(f"Unsupported device for ssim tests: {device_name}")
+device_reference_folder = resolve_device_reference_folder(
+    (
+        ("A40", "A40"),
+        ("L40S", "L40S"),
+        ("A100", "A100"),
+        ("H100", "H100"),
+        ("GB200", "GB200"),
+        ("H200", "H200"),
+    ),
+    device_name=get_cuda_device_name(),
+    unknown_device_prefix="Unknown",
+    logger=logger,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers – camera trajectory (self-contained, no official repo dependency)
@@ -82,20 +91,43 @@ GAMECRAFT_T2V_PARAMS = {
     "negative_prompt": "",
 }
 
+_GAMECRAFT_FULL_QUALITY_DEFAULTS = SamplingParam.from_pretrained(_GAMECRAFT_MODEL_PATH)
+GAMECRAFT_T2V_FULL_QUALITY_PARAMS = {
+    "num_gpus": GAMECRAFT_T2V_PARAMS["num_gpus"],
+    "model_path": GAMECRAFT_T2V_PARAMS["model_path"],
+    "height": _GAMECRAFT_FULL_QUALITY_DEFAULTS.height,
+    "width": _GAMECRAFT_FULL_QUALITY_DEFAULTS.width,
+    "num_frames": GAMECRAFT_T2V_PARAMS["num_frames"],  # default num_frames: 33
+    "num_inference_steps": _GAMECRAFT_FULL_QUALITY_DEFAULTS.num_inference_steps,
+    "guidance_scale": _GAMECRAFT_FULL_QUALITY_DEFAULTS.guidance_scale,
+    "seed": _GAMECRAFT_FULL_QUALITY_DEFAULTS.seed,
+    "action": GAMECRAFT_T2V_PARAMS["action"],
+    "action_speed": GAMECRAFT_T2V_PARAMS["action_speed"],
+    "negative_prompt": _GAMECRAFT_FULL_QUALITY_DEFAULTS.negative_prompt,
+}
+
 GAMECRAFT_I2V_PARAMS = {
     **GAMECRAFT_T2V_PARAMS,
-    "image_path": (
-        "https://huggingface.co/datasets/huggingface/documentation-images/"
-        "resolve/main/diffusers/astronaut.jpg"
-    ),
+    "image_path": ("https://huggingface.co/datasets/huggingface/documentation-images/"
+                   "resolve/main/diffusers/astronaut.jpg"),
+}
+GAMECRAFT_I2V_FULL_QUALITY_PARAMS = {
+    **GAMECRAFT_T2V_FULL_QUALITY_PARAMS,
+    "image_path": GAMECRAFT_I2V_PARAMS["image_path"],
 }
 
 MODEL_TO_PARAMS = {
     "HunyuanGameCraft-T2V": GAMECRAFT_T2V_PARAMS,
 }
+FULL_QUALITY_MODEL_TO_PARAMS = {
+    "HunyuanGameCraft-T2V": GAMECRAFT_T2V_FULL_QUALITY_PARAMS,
+}
 
 I2V_MODEL_TO_PARAMS = {
     "HunyuanGameCraft-I2V": GAMECRAFT_I2V_PARAMS,
+}
+FULL_QUALITY_I2V_MODEL_TO_PARAMS = {
+    "HunyuanGameCraft-I2V": GAMECRAFT_I2V_FULL_QUALITY_PARAMS,
 }
 
 TEST_PROMPTS = [
@@ -119,13 +151,21 @@ def test_gamecraft_t2v_similarity(prompt, ATTENTION_BACKEND, model_id):
     os.environ["FASTVIDEO_ATTENTION_BACKEND"] = ATTENTION_BACKEND
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    base_output_dir = os.path.join(script_dir, "generated_videos", model_id)
-    output_dir = os.path.join(base_output_dir, ATTENTION_BACKEND)
+    output_dir = build_generated_output_dir(
+        script_dir,
+        device_reference_folder,
+        model_id,
+        ATTENTION_BACKEND,
+    )
     output_video_name = f"{prompt[:100].strip()}.mp4"
 
     os.makedirs(output_dir, exist_ok=True)
 
-    BASE_PARAMS = MODEL_TO_PARAMS[model_id]
+    params_map = select_ssim_params(
+        MODEL_TO_PARAMS,
+        FULL_QUALITY_MODEL_TO_PARAMS,
+    )
+    BASE_PARAMS = params_map[model_id]
     num_inference_steps = BASE_PARAMS["num_inference_steps"]
 
     # Build camera trajectory
@@ -163,27 +203,24 @@ def test_gamecraft_t2v_similarity(prompt, ATTENTION_BACKEND, model_id):
 
     generator: VideoGenerator | None = None
     try:
-        generator = VideoGenerator.from_pretrained(
-            model_path=BASE_PARAMS["model_path"], **init_kwargs
-        )
+        generator = VideoGenerator.from_pretrained(model_path=BASE_PARAMS["model_path"], **init_kwargs)
         generator.generate_video(prompt, **generation_kwargs)
     finally:
         _shutdown_executor(generator)
 
-    assert os.path.exists(output_dir), (
-        f"Output video was not generated at {output_dir}"
-    )
+    assert os.path.exists(output_dir), (f"Output video was not generated at {output_dir}")
 
     # Compare to reference
-    reference_folder = os.path.join(
-        script_dir, device_reference_folder, model_id, ATTENTION_BACKEND
+    reference_folder = build_reference_folder_path(
+        script_dir,
+        device_reference_folder,
+        model_id,
+        ATTENTION_BACKEND,
     )
 
     if not os.path.exists(reference_folder):
         logger.error("Reference folder missing")
-        raise FileNotFoundError(
-            f"Reference video folder does not exist: {reference_folder}"
-        )
+        raise FileNotFoundError(f"Reference video folder does not exist: {reference_folder}")
 
     reference_video_name = None
     for filename in os.listdir(reference_folder):
@@ -192,21 +229,15 @@ def test_gamecraft_t2v_similarity(prompt, ATTENTION_BACKEND, model_id):
             break
 
     if not reference_video_name:
-        logger.error(
-            f"Reference video not found for prompt: {prompt} "
-            f"with backend: {ATTENTION_BACKEND}"
-        )
+        logger.error(f"Reference video not found for prompt: {prompt} "
+                     f"with backend: {ATTENTION_BACKEND}")
         raise FileNotFoundError("Reference video missing")
 
     reference_video_path = os.path.join(reference_folder, reference_video_name)
     generated_video_path = os.path.join(output_dir, output_video_name)
 
-    logger.info(
-        f"Computing SSIM between {reference_video_path} and {generated_video_path}"
-    )
-    ssim_values = compute_video_ssim_torchvision(
-        reference_video_path, generated_video_path, use_ms_ssim=True
-    )
+    logger.info(f"Computing SSIM between {reference_video_path} and {generated_video_path}")
+    ssim_values = compute_video_ssim_torchvision(reference_video_path, generated_video_path, use_ms_ssim=True)
 
     mean_ssim = ssim_values[0]
     logger.info(f"SSIM mean value: {mean_ssim}")
@@ -225,10 +256,8 @@ def test_gamecraft_t2v_similarity(prompt, ATTENTION_BACKEND, model_id):
         logger.error("Failed to write SSIM results to file")
 
     min_acceptable_ssim = 0.93
-    assert mean_ssim >= min_acceptable_ssim, (
-        f"SSIM value {mean_ssim} is below threshold {min_acceptable_ssim} "
-        f"for {model_id} with backend {ATTENTION_BACKEND}"
-    )
+    assert mean_ssim >= min_acceptable_ssim, (f"SSIM value {mean_ssim} is below threshold {min_acceptable_ssim} "
+                                              f"for {model_id} with backend {ATTENTION_BACKEND}")
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +273,21 @@ def test_gamecraft_i2v_similarity(prompt, ATTENTION_BACKEND, model_id):
     os.environ["FASTVIDEO_ATTENTION_BACKEND"] = ATTENTION_BACKEND
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    base_output_dir = os.path.join(script_dir, "generated_videos", model_id)
-    output_dir = os.path.join(base_output_dir, ATTENTION_BACKEND)
+    output_dir = build_generated_output_dir(
+        script_dir,
+        device_reference_folder,
+        model_id,
+        ATTENTION_BACKEND,
+    )
     output_video_name = f"{prompt[:100].strip()}.mp4"
 
     os.makedirs(output_dir, exist_ok=True)
 
-    BASE_PARAMS = I2V_MODEL_TO_PARAMS[model_id]
+    params_map = select_ssim_params(
+        I2V_MODEL_TO_PARAMS,
+        FULL_QUALITY_I2V_MODEL_TO_PARAMS,
+    )
+    BASE_PARAMS = params_map[model_id]
     num_inference_steps = BASE_PARAMS["num_inference_steps"]
 
     # Build camera trajectory
@@ -289,27 +326,24 @@ def test_gamecraft_i2v_similarity(prompt, ATTENTION_BACKEND, model_id):
 
     generator: VideoGenerator | None = None
     try:
-        generator = VideoGenerator.from_pretrained(
-            model_path=BASE_PARAMS["model_path"], **init_kwargs
-        )
+        generator = VideoGenerator.from_pretrained(model_path=BASE_PARAMS["model_path"], **init_kwargs)
         generator.generate_video(prompt, **generation_kwargs)
     finally:
         _shutdown_executor(generator)
 
-    assert os.path.exists(output_dir), (
-        f"Output video was not generated at {output_dir}"
-    )
+    assert os.path.exists(output_dir), (f"Output video was not generated at {output_dir}")
 
     # Compare to reference
-    reference_folder = os.path.join(
-        script_dir, device_reference_folder, model_id, ATTENTION_BACKEND
+    reference_folder = build_reference_folder_path(
+        script_dir,
+        device_reference_folder,
+        model_id,
+        ATTENTION_BACKEND,
     )
 
     if not os.path.exists(reference_folder):
         logger.error("Reference folder missing")
-        raise FileNotFoundError(
-            f"Reference video folder does not exist: {reference_folder}"
-        )
+        raise FileNotFoundError(f"Reference video folder does not exist: {reference_folder}")
 
     reference_video_name = None
     for filename in os.listdir(reference_folder):
@@ -318,21 +352,15 @@ def test_gamecraft_i2v_similarity(prompt, ATTENTION_BACKEND, model_id):
             break
 
     if not reference_video_name:
-        logger.error(
-            f"Reference video not found for prompt: {prompt} "
-            f"with backend: {ATTENTION_BACKEND}"
-        )
+        logger.error(f"Reference video not found for prompt: {prompt} "
+                     f"with backend: {ATTENTION_BACKEND}")
         raise FileNotFoundError("Reference video missing")
 
     reference_video_path = os.path.join(reference_folder, reference_video_name)
     generated_video_path = os.path.join(output_dir, output_video_name)
 
-    logger.info(
-        f"Computing SSIM between {reference_video_path} and {generated_video_path}"
-    )
-    ssim_values = compute_video_ssim_torchvision(
-        reference_video_path, generated_video_path, use_ms_ssim=True
-    )
+    logger.info(f"Computing SSIM between {reference_video_path} and {generated_video_path}")
+    ssim_values = compute_video_ssim_torchvision(reference_video_path, generated_video_path, use_ms_ssim=True)
 
     mean_ssim = ssim_values[0]
     logger.info(f"SSIM mean value: {mean_ssim}")
@@ -351,7 +379,5 @@ def test_gamecraft_i2v_similarity(prompt, ATTENTION_BACKEND, model_id):
         logger.error("Failed to write SSIM results to file")
 
     min_acceptable_ssim = 0.93
-    assert mean_ssim >= min_acceptable_ssim, (
-        f"SSIM value {mean_ssim} is below threshold {min_acceptable_ssim} "
-        f"for {model_id} with backend {ATTENTION_BACKEND}"
-    )
+    assert mean_ssim >= min_acceptable_ssim, (f"SSIM value {mean_ssim} is below threshold {min_acceptable_ssim} "
+                                              f"for {model_id} with backend {ATTENTION_BACKEND}")

@@ -1,6 +1,19 @@
 #!/bin/bash
 set -uo pipefail
 
+# DORMANT ROLLBACK ONLY. Active CI is Slurm-only and pipeline.yml never calls
+# this launcher. Refuse every Buildkite invocation even if a stale step or
+# operator typo reaches this file; local rollback experiments require an
+# explicit opt-in.
+if [ -n "${BUILDKITE:-}" ]; then
+  echo "Legacy Modal CI is disabled; use the Slinky Slurm runner." >&2
+  exit 2
+fi
+if [ "${FASTVIDEO_ENABLE_LEGACY_MODAL_CI:-0}" != 1 ]; then
+  echo "Legacy Modal CI is dormant. Set FASTVIDEO_ENABLE_LEGACY_MODAL_CI=1 only for a manual rollback test." >&2
+  exit 2
+fi
+
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
@@ -15,8 +28,21 @@ log "Project root: $PROJECT_ROOT"
 # Install Modal if not available
 if ! python3 -m modal --version &> /dev/null; then
     log "Modal not found, installing..."
-    python3 -m pip install modal
-    
+    if ! command -v uv &> /dev/null; then
+        log "uv not found, bootstrapping..."
+        if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+            log "Error: Failed to bootstrap uv via astral.sh installer."
+            exit 1
+        fi
+        export PATH="$HOME/.local/bin:$PATH"
+        if ! command -v uv &> /dev/null; then
+            log "Error: uv still not on PATH after bootstrap."
+            exit 1
+        fi
+    fi
+    # --break-system-packages preserves prior `pip install --user` semantics on PEP 668 agents.
+    uv pip install --system --break-system-packages modal
+
     # Verify installation
     if ! python3 -m modal --version &> /dev/null; then
         log "Error: Failed to install modal. Please install it manually."
@@ -59,7 +85,107 @@ if [ -z "${TEST_TYPE:-}" ]; then
 fi
 log "Test type: $TEST_TYPE"
 
-MODAL_ENV="BUILDKITE_REPO=$BUILDKITE_REPO BUILDKITE_COMMIT=$BUILDKITE_COMMIT BUILDKITE_PULL_REQUEST=$BUILDKITE_PULL_REQUEST IMAGE_VERSION=$IMAGE_VERSION"
+EFFECTIVE_PR=${BUILDKITE_PULL_REQUEST:-false}
+if [ "$EFFECTIVE_PR" = "false" ] && [ -n "${PR_NUMBER:-}" ]; then
+    EFFECTIVE_PR=$PR_NUMBER
+fi
+MODAL_ENV="BUILDKITE_REPO=$BUILDKITE_REPO BUILDKITE_COMMIT=$BUILDKITE_COMMIT BUILDKITE_PULL_REQUEST=$EFFECTIVE_PR BUILDKITE_BRANCH=${BUILDKITE_BRANCH:-} BUILDKITE_SOURCE=${BUILDKITE_SOURCE:-} TEST_SCOPE=${TEST_SCOPE:-} BUILDKITE_BUILD_URL=${BUILDKITE_BUILD_URL:-} BUILDKITE_BUILD_ID=${BUILDKITE_BUILD_ID:-} BUILDKITE_JOB_ID=${BUILDKITE_JOB_ID:-} IMAGE_VERSION=$IMAGE_VERSION"
+
+POST_RUN_HOOK=""
+
+is_truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ssim_bootstrap_args() {
+    local title="${PR_TITLE:-}"
+    local message="${BUILDKITE_MESSAGE:-}"
+    if is_truthy "${FASTVIDEO_SSIM_BOOTSTRAP_MODE:-}" \
+        || [[ "$title" == *"[new-model]"* ]] \
+        || [[ "$message" == *"[new-model]"* ]]; then
+        printf ' --bootstrap-mode'
+    fi
+}
+
+upload_performance_artifacts() {
+    SHORT_SHA=${BUILDKITE_COMMIT:0:7}
+    LOCAL_DIR="downloaded_reports"
+
+    _download_reports() {
+        log "Downloading perf_reports/ from Modal Volume..."
+        mkdir -p "$LOCAL_DIR"
+        if ! modal volume get hf-model-weights "perf_reports/" "$LOCAL_DIR"; then
+            log "Error: Failed to download perf_reports/ from Modal Volume."
+            return 1
+        fi
+    }
+
+    _upload_dashboard() {
+        local target
+        target=$(find "$LOCAL_DIR" -name "dashboard_${SHORT_SHA}_*" | head -n 1)
+        log "TARGET dashboard: '$target'"
+
+        if [ -n "$target" ]; then
+            log "Found dashboard: $target. Uploading to Buildkite..."
+            buildkite-agent artifact upload "$target"
+            buildkite-agent annotate --style info --context "perf-dashboard" < "$target"
+        else
+            log "Warning: Could not find a dashboard file matching $SHORT_SHA"
+        fi
+    }
+
+    _upload_perf_summary() {
+        local target
+        target=$(find "$LOCAL_DIR" -name "perf_${SHORT_SHA}_*" | head -n 1)
+        log "TARGET perf summary: '$target'"
+
+        if [ -n "$target" ]; then
+            log "Found perf summary: $target. Uploading to Buildkite..."
+            buildkite-agent artifact upload "$target"
+            buildkite-agent annotate --style info --context "perf-summary" < "$target"
+        else
+            log "Warning: Could not find a perf summary file matching $SHORT_SHA"
+        fi
+    }
+
+    _upload_normalized_perf_results() {
+        local found=0
+        while IFS= read -r -d '' target; do
+            found=1
+            log "Found normalized performance result: $target. Uploading to Buildkite..."
+            buildkite-agent artifact upload "$target"
+        done < <(find "$LOCAL_DIR" -path "*/results/normalized_perf_*.json" -print0)
+
+        if [ "$found" -eq 0 ]; then
+            log "No normalized performance result artifacts found. This is expected when the rolling performance comparison did not run."
+        fi
+    }
+
+    _cleanup_modal_volume() {
+        log "Cleaning up perf_reports/ from Modal Volume..."
+        if modal volume rm hf-model-weights "perf_reports/" --recursive; then
+            log "Successfully deleted perf_reports/ from Modal Volume."
+        else
+            log "Warning: Failed to delete perf_reports/ from Modal Volume. Manual cleanup may be required."
+        fi
+    }
+
+    _cleanup_local() {
+        log "Cleaning up local download directory..."
+        rm -rf "$LOCAL_DIR"
+    }
+
+    # --- Main flow ---
+    _download_reports || { _cleanup_local; return 1; }
+    _upload_dashboard
+    _upload_perf_summary
+    _upload_normalized_perf_results
+    _cleanup_modal_volume
+    _cleanup_local
+}
 
 case "$TEST_TYPE" in
     "encoder")
@@ -74,9 +200,18 @@ case "$TEST_TYPE" in
         log "Running transformer tests..."
         MODAL_COMMAND="$MODAL_ENV HF_API_KEY=$HF_API_KEY python3 -m modal run $MODAL_TEST_FILE::run_transformer_tests"
         ;;
+    "golden_gate")
+        log "Running golden-gate tests..."
+        MODAL_COMMAND="$MODAL_ENV HF_API_KEY=$HF_API_KEY python3 -m modal run $MODAL_TEST_FILE::run_golden_gate_tests"
+        ;;
     "ssim")
         log "Running SSIM tests..."
-        MODAL_COMMAND="$MODAL_ENV HF_API_KEY=$HF_API_KEY python3 -m modal run $MODAL_SSIM_TEST_FILE::run_ssim_tests"
+        SSIM_BOOTSTRAP_ARGS=$(ssim_bootstrap_args)
+        if [ -n "$SSIM_BOOTSTRAP_ARGS" ]; then
+            log "SSIM bootstrap mode enabled for new-model reference draft generation"
+        fi
+        MODAL_COMMAND="$MODAL_ENV HF_API_KEY=$HF_API_KEY python3 -m modal run "
+        MODAL_COMMAND+="$MODAL_SSIM_TEST_FILE::run_ssim_tests$SSIM_BOOTSTRAP_ARGS"
         ;;
     "training")
         log "Running training tests..."
@@ -115,13 +250,26 @@ case "$TEST_TYPE" in
         log "Running unit tests..."
         MODAL_COMMAND="$MODAL_ENV python3 -m modal run $MODAL_TEST_FILE::run_unit_test"
         ;;
+    "dreamverse_app")
+        log "Running DreamVerse app tests..."
+        MODAL_COMMAND="$MODAL_ENV python3 -m modal run $MODAL_TEST_FILE::run_dreamverse_app_tests"
+        ;;
+    "train_framework")
+        log "Running fastvideo.train framework tests..."
+        MODAL_COMMAND="$MODAL_ENV HF_API_KEY=$HF_API_KEY python3 -m modal run $MODAL_TEST_FILE::run_train_framework_tests"
+        ;;
+    "eval")
+        log "Running eval metric tests..."
+        MODAL_COMMAND="$MODAL_ENV HF_API_KEY=$HF_API_KEY python3 -m modal run $MODAL_TEST_FILE::run_eval_tests"
+        ;;
     "lora_extraction")
         log "Running LoRA extraction tests..."
         MODAL_COMMAND="$MODAL_ENV HF_API_KEY=$HF_API_KEY python3 -m modal run $MODAL_TEST_FILE::run_lora_extraction_tests"
         ;;
     "performance")
-        log "Running performance tests..."
+        log "Running performance tests on Modal..."
         MODAL_COMMAND="$MODAL_ENV HF_API_KEY=$HF_API_KEY python3 -m modal run $MODAL_TEST_FILE::run_performance_tests"
+        POST_RUN_HOOK="upload_performance_artifacts"
         ;;
     "api_server")
         log "Running API server integration tests..."
@@ -141,6 +289,11 @@ if [ $TEST_EXIT_CODE -eq 0 ]; then
     log "Modal test completed successfully"
 else
     log "Error: Modal test failed with exit code: $TEST_EXIT_CODE"
+fi
+
+if [ -n "$POST_RUN_HOOK" ]; then
+    log "Executing post-run hook: $POST_RUN_HOOK"
+    "$POST_RUN_HOOK"
 fi
 
 log "=== Test execution completed with exit code: $TEST_EXIT_CODE ==="

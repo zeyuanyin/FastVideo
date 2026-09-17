@@ -43,8 +43,10 @@ FastVideo maps a Diffusers-style repo into a pipeline like:
 - `fastvideo/models/*`: model implementations (DiT, VAE, encoders, upsamplers).
 - `fastvideo/configs/models/*`: arch configs and `param_names_mapping` for
   weight name translation.
+- `fastvideo/models/wan/`: Wan's dense transformer, VAE, and component configs
+  live together. The old Wan modules remain compatibility re-exports.
 - `fastvideo/configs/pipelines/*`: pipeline wiring (component classes + names).
-- `fastvideo/configs/sample/*`: default runtime sampling parameters.
+- `fastvideo/api/sampling_param.py`: runtime sampling parameters.
 - `fastvideo/pipelines/basic/*`: end-to-end pipeline logic built from stages.
 - `model_index.json`: the HF repo entrypoint that maps component names to
   classes and weight files.
@@ -55,7 +57,7 @@ Minimal usage example (based on `examples/inference/basic/basic.py`):
 
 ```python
 from fastvideo import VideoGenerator
-from fastvideo.configs.sample import SamplingParam
+from fastvideo.api.sampling_param import SamplingParam
 
 model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"  # or official_weights/<model_name>/
 generator = VideoGenerator.from_pretrained(model_id, num_gpus=1)
@@ -209,7 +211,7 @@ class OfficialWanTransformer(torch.nn.Module):
     def forward(self, x):
         return self.patch_embedding(x)
 
-# FastVideo model (simplified) in fastvideo/models/dits/wanvideo.py
+# FastVideo model (simplified) in fastvideo/models/wan/transformer.py
 class PatchEmbed(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -227,7 +229,7 @@ class WanTransformer3DModel(torch.nn.Module):
         return self.patch_embedding(x)
 
 # Mapping defined in a config (simplified; see the real mapping in
-# fastvideo/configs/models/dits/wanvideo.py)
+# fastvideo/models/wan/config.py)
 param_names_mapping = {
     r"^patch_embedding\.(.*)$": r"patch_embedding.proj.\1",
     r"^blocks\.(\d+)\.attn1\.to_q\.(.*)$": r"blocks.\1.to_q.\2",
@@ -275,7 +277,7 @@ Mapping steps:
   - Instantiate the FastVideo DiT (`WanTransformer3DModel`) and compare
     its `state_dict().keys()` to the official keys.
   - Update `param_names_mapping` in
-    fastvideo/configs/models/dits/wanvideo.py to resolve missing/unexpected keys.
+    fastvideo/models/wan/config.py to resolve missing/unexpected keys.
   - Use `load_state_dict(strict=False)` during iteration to surface mismatches.
 ```
 
@@ -296,8 +298,10 @@ Action:
 
 - Add or reuse a numerical parity test that loads the official model and the
   FastVideo model and compares outputs.
-- See examples in `tests/local_tests/` (e.g., `tests/local_tests/upsamplers/`)
-  and the commands in `tests/local_tests/README.md`.
+- See examples in `tests/local_tests/` organized by model family
+  (e.g., `tests/local_tests/sd35/`, `tests/local_tests/ltx2/`,
+  `tests/local_tests/stable_audio/`) and the navigation index in
+  `tests/local_tests/README.md`.
 - If there are discrepancies, add opt‑in logging to both models and compare
   activation summaries (layer output sums, per‑stage logs).
 - First align the loaded weights (validate `param_names_mapping`).
@@ -319,7 +323,8 @@ Purpose:
 
 - `fastvideo/configs/pipelines/` describes pipeline wiring and model module
   names.
-- `fastvideo/configs/sample/` defines default runtime parameters.
+- `fastvideo/api/sampling_param.py` defines runtime sampling parameters.
+  Defaults come from profiles in `fastvideo/pipelines/basic/<family>/profiles.py`.
 
 Action:
 
@@ -347,7 +352,8 @@ Purpose:
 
 Action:
 
-- Add a pipeline parity test under `tests/local_tests/pipelines/`.
+- Add a pipeline parity test under `tests/local_tests/<family>/`
+  (e.g., `tests/local_tests/<family>/test_<family>_pipeline_parity.py`).
 - See the [Testing Guide](testing.md) for test conventions.
 
 ### 7) Add user‑facing examples
@@ -462,19 +468,24 @@ The Wan2.1 T2V 1.3B Diffusers pipeline is a good “standard” example for
 FastVideo integration.
 
 1. Verify model config + mapping.
-   - DiT mapping: `fastvideo/configs/models/dits/wanvideo.py`
-   - VAE: `fastvideo/models/vaes/wanvae.py`
+   - DiT: `fastvideo/models/wan/transformer.py`
+   - DiT mapping: `fastvideo/models/wan/config.py`
+   - VAE: `fastvideo/models/wan/vae.py`
+   - VAE config: `fastvideo/models/wan/vae_config.py`
    - Text encoder: `fastvideo/models/encoders/t5.py`
 
 2. Parity test the core components.
+   - Start with `bash scripts/validate_wan.sh all`: contracts and tiny goldens.
    - Example tests: `fastvideo/tests/transformers/test_wanvideo.py`,
      `fastvideo/tests/vaes/test_wan_vae.py`,
      `fastvideo/tests/encoders/test_t5_encoder.py`
 
 3. Pipeline wiring.
    - Pipeline: `fastvideo/pipelines/basic/wan/wan_pipeline.py`
-   - Pipeline config: `fastvideo/configs/pipelines/wan.py`
-   - Sampling defaults: `fastvideo/configs/sample/wan.py`
+   - Denoising and first-frame preparation: `fastvideo/pipelines/basic/wan/stages/`
+   - Variant definitions: `fastvideo/models/wan/definition.py`
+   - Pipeline config: `fastvideo/models/wan/pipeline_config.py`
+   - Sampling defaults: `fastvideo/pipelines/basic/wan/presets.py`
 
 4. Minimal example.
    - Script: `examples/inference/basic/basic.py`

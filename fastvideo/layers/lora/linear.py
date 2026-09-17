@@ -39,6 +39,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_alpha = lora_alpha
         self.training_mode = training_mode
         self.lora_path: str | None = None
+        self.lora_strength: float = 1.0
 
         if training_mode:
             assert self.lora_rank is not None, "LoRA rank  must be set for training mode"
@@ -63,6 +64,29 @@ class BaseLayerWithLoRA(nn.Module):
             self.lora_A = None
             self.lora_B = None
 
+    @property
+    def weight(self) -> torch.Tensor:
+        """The wrapped layer's weight.
+
+        Model code reads ``layer.weight`` for perfectly ordinary reasons -- MiniMax H3's
+        AdaLN modulation casts its input with ``self.linear.weight.dtype``, and its
+        ``proj_in`` reads the tensor itself. Wrapping a layer should not change what
+        reading it looks like from outside, and without this the wrap turns those into
+        ``AttributeError`` at the first forward. Forcing every model to be listed in
+        ``lora_target_modules`` around its own attribute access is the wrong fix: the
+        list would have to be maintained against code it does not own, and getting it
+        wrong fails at generation time rather than at load.
+
+        Resolved through ``base_layer`` on each access rather than cached, because
+        merging replaces that module outright.
+        """
+        return self.base_layer.weight
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        """The wrapped layer's bias, or ``None`` when it has none."""
+        return getattr(self.base_layer, "bias", None)
+
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lora_A = self.lora_A
@@ -79,6 +103,7 @@ class BaseLayerWithLoRA(nn.Module):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
+            delta = delta * self.lora_strength
             out, output_bias = self.base_layer(x)
             return out + delta, output_bias
         else:
@@ -96,7 +121,9 @@ class BaseLayerWithLoRA(nn.Module):
                          B: torch.Tensor,
                          lora_alpha: float | None = None,
                          training_mode: bool = False,
-                         lora_path: str | None = None) -> None:
+                         lora_path: str | None = None,
+                         strength: float = 1.0,
+                         accumulate: bool = False) -> None:
         self.lora_A = torch.nn.Parameter(A)  # share storage with weights in the pipeline
         self.lora_B = torch.nn.Parameter(B)
         self.disable_lora = False
@@ -105,17 +132,18 @@ class BaseLayerWithLoRA(nn.Module):
         rank = A.shape[0]  # rank is the first dimension of A
         self.lora_rank = rank
         self.lora_alpha = int(lora_alpha) if lora_alpha is not None else rank
+        self.lora_strength = float(strength)
 
         if not training_mode:
-            self.merge_lora_weights()
+            self.merge_lora_weights(accumulate=accumulate)
         self.lora_path = lora_path
 
     @torch.no_grad()
-    def merge_lora_weights(self) -> None:
+    def merge_lora_weights(self, accumulate: bool = False) -> None:
         if self.disable_lora:
             return
 
-        if self.merged:
+        if self.merged and not accumulate:
             self.unmerge_lora_weights()
         assert self.lora_A is not None and self.lora_B is not None, "LoRA weights not set. Please set them first."
         if isinstance(self.base_layer.weight, DTensor):
@@ -136,8 +164,8 @@ class BaseLayerWithLoRA(nn.Module):
             # Apply LoRA with alpha scaling
             lora_delta = (
                 self.slice_lora_b_weights(self.lora_B).to(data) @ self.slice_lora_a_weights(self.lora_A).to(data))
-            if self.lora_alpha and self.lora_rank and self.lora_alpha != self.lora_rank:
-                lora_delta *= (self.lora_alpha / self.lora_rank)
+            scale = ((self.lora_alpha / self.lora_rank) if (self.lora_alpha and self.lora_rank) else 1.0)
+            lora_delta *= scale * self.lora_strength
             data += lora_delta
             unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
@@ -159,8 +187,8 @@ class BaseLayerWithLoRA(nn.Module):
             # Apply LoRA with alpha scaling
             lora_delta = (
                 self.slice_lora_b_weights(self.lora_B.to(data)) @ self.slice_lora_a_weights(self.lora_A.to(data)))
-            if self.lora_alpha and self.lora_rank and self.lora_alpha != self.lora_rank:
-                lora_delta *= (self.lora_alpha / self.lora_rank)
+            scale = ((self.lora_alpha / self.lora_rank) if (self.lora_alpha and self.lora_rank) else 1.0)
+            lora_delta *= scale * self.lora_strength
             data += lora_delta
             self.base_layer.weight.data = data.to(current_device, non_blocking=True)
 
@@ -168,12 +196,14 @@ class BaseLayerWithLoRA(nn.Module):
 
     @torch.no_grad()
     # @torch.compile(dynamic=True)
-    def unmerge_lora_weights(self) -> None:
+    def unmerge_lora_weights(self, *, if_merged_only: bool = True) -> None:
         if self.disable_lora:
             return
 
         if not self.merged:
-            raise ValueError("LoRA weights not merged. Please merge them first before unmerging.")
+            if if_merged_only:
+                return
+            raise ValueError("unmerge_lora_weights called but no LoRA is currently merged")
 
         # avoid precision loss
         if isinstance(self.base_layer.weight, DTensor):

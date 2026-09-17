@@ -9,6 +9,7 @@ from typing import Any, Literal, TYPE_CHECKING
 import torch
 
 from fastvideo.forward_context import set_forward_context
+from fastvideo.platforms import AttentionBackendEnum
 
 from fastvideo.train.models.base import CausalModelBase
 from fastvideo.train.models.wan.wan import WanModel
@@ -16,6 +17,7 @@ from fastvideo.train.models.wan.wan import WanModel
 if TYPE_CHECKING:
     from fastvideo.train.utils.training_config import (
         TrainingConfig, )
+    from fastvideo.train.utils.lora import LoraConfig
 
 
 @dataclass(slots=True)
@@ -47,6 +49,9 @@ class WanCausalModel(WanModel, CausalModelBase):
         | None = None,
         transformer_override_safetensor: str
         | None = None,
+        lora: LoraConfig | dict[str, Any] | None = None,
+        num_frames_per_block: int | None = None,
+        attention_backend: AttentionBackendEnum | str | None = None,
     ) -> None:
         super().__init__(
             init_from=init_from,
@@ -56,8 +61,20 @@ class WanCausalModel(WanModel, CausalModelBase):
             flow_shift=flow_shift,
             enable_gradient_checkpointing_type=(enable_gradient_checkpointing_type),
             transformer_override_safetensor=(transformer_override_safetensor),
+            lora=lora,
+            attention_backend=attention_backend,
         )
         self._streaming_caches: (dict[tuple[int, str], _StreamingCaches]) = {}
+
+        if num_frames_per_block is not None:
+            num_frames_per_block = int(num_frames_per_block)
+            if not 1 <= num_frames_per_block <= 3:
+                # Same bound as CausalWanTransformer3DModel's config path
+                # (assert num_frame_per_block <= 3); this override must not
+                # bypass it.
+                raise ValueError("num_frames_per_block must be between 1 and 3, "
+                                 f"got {num_frames_per_block}")
+            self.transformer.num_frame_per_block = num_frames_per_block
 
     # --- CausalModelBase override: clear_caches ---
     def clear_caches(
@@ -115,6 +132,13 @@ class WanCausalModel(WanModel, CausalModelBase):
 
         if (self._should_snapshot_streaming_cache() and torch.is_grad_enabled()):
             kv_cache = self._snapshot_kv_cache_indices(kv_cache)
+            # The cross-attn cache is stateful inside the checkpointed block
+            # forward (is_init flip + k/v writes); a checkpoint recompute that
+            # sees the mutated dict skips the k/v projections and trips
+            # torch's saved-tensor-count check. Grad-enabled forwards
+            # recompute cross k/v instead, matching the legacy
+            # gradient_checkpointing branch of _forward_inference.
+            crossattn_cache = None
 
         model_kwargs: dict[str, Any] = {
             "kv_cache": kv_cache,
@@ -125,7 +149,9 @@ class WanCausalModel(WanModel, CausalModelBase):
         }
 
         device_type = self.device.type
-        dtype = noisy_latents.dtype
+        dtype = self._get_training_dtype()
+        if noisy_latents.is_floating_point():
+            noisy_latents = noisy_latents.to(dtype=dtype)
 
         if conditional:
             text_dict = batch.conditional_dict
@@ -349,9 +375,15 @@ class WanCausalModel(WanModel, CausalModelBase):
 
         if checkpoint_safe:
             tc = getattr(self, "training_config", None)
-            total_frames = int(tc.data.num_frames if tc is not None else 0)
+            total_frames = int(getattr(tc.data, "num_latent_t", 0) if tc is not None else 0)
+            if total_frames <= 0 and tc is not None:
+                raw_num_frames = int(getattr(tc.data, "num_frames", 0))
+                if raw_num_frames > 0:
+                    temporal_compression_ratio = int(
+                        tc.pipeline_config.vae_config.arch_config.temporal_compression_ratio)
+                    total_frames = (raw_num_frames - 1) // temporal_compression_ratio + 1
             if total_frames <= 0:
-                raise ValueError("training.num_frames must be set "
+                raise ValueError("training.data.num_latent_t must be set "
                                  "to enable checkpoint-safe "
                                  "streaming KV cache; got "
                                  f"{total_frames}")
